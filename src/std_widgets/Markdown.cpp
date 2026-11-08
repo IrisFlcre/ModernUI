@@ -1789,6 +1789,8 @@ void MarkdownView::onLayout(const Rect& frame) {
 bool MarkdownView::onEvent(const Event& ev) {
     switch (ev.type) {
         case EventType::MouseWheel: {
+            // Ctrl / 触控板捏合交给父控件做缩放，避免和滚动抢事件。
+            if ((ev.modifiers & ModifierControl) != 0) return false;
             const int32_t step = std::max(8, theme_.lineHeight * 3);
             scrollBy(-static_cast<int32_t>(
                 std::lround(ev.wheelDelta * static_cast<float>(step))));
@@ -1797,6 +1799,8 @@ bool MarkdownView::onEvent(const Event& ev) {
 
         case EventType::MouseDown:
         case EventType::MouseUp:
+            // 触控事件向上冒泡，让外层容器实现双指捏合缩放。
+            if (ev.pointerType == PointerType::Touch) return false;
             return ev.button == MouseButtonLeft;
 
         case EventType::KeyDown: {

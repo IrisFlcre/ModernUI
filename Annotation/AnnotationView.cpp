@@ -873,6 +873,15 @@ void AnnotationView::handleHotkey(int id) {
         case HotkeyPrevPage: gotoPrevPage(); break;
         case HotkeyNextPage: gotoNextPage(); break;
         case HotkeyCopyOcr: copyAllOcrText(); break;
+        case HotkeyDocumentZoomIn:
+            if (documentPanel_) documentPanel_->zoomBy(0.1f);
+            break;
+        case HotkeyDocumentZoomOut:
+            if (documentPanel_) documentPanel_->zoomBy(-0.1f);
+            break;
+        case HotkeyDocumentZoomReset:
+            if (documentPanel_) documentPanel_->resetZoom();
+            break;
         case HotkeyQuit:
             if (onQuitRequested) onQuitRequested();
             break;
@@ -1815,6 +1824,20 @@ void AnnotationView::showDocumentPanel(const std::string& markdown) {
         documentPanel_->onBoundsChanged = [this](const Rect& rect) {
             documentPanelRect_ = rect;
         };
+
+        // 覆盖层无法获得键盘焦点（no-activate + 点击穿透），
+        // 面板打开期间用动态全局热键提供 Ctrl + +/-/0 缩放。
+        if (window_) {
+            window_->registerHotkey(HotkeyDocumentZoomIn,
+                                    modern_ui::ModifierControl, VK_OEM_PLUS);
+            window_->registerHotkey(HotkeyDocumentZoomInShift,
+                                    modern_ui::ModifierControl | modern_ui::ModifierShift,
+                                    VK_OEM_PLUS);
+            window_->registerHotkey(HotkeyDocumentZoomOut,
+                                    modern_ui::ModifierControl, VK_OEM_MINUS);
+            window_->registerHotkey(HotkeyDocumentZoomReset,
+                                    modern_ui::ModifierControl, '0');
+        }
     }
 
     documentPanel_->setDocument("文档解析", markdown);
@@ -1831,6 +1854,14 @@ void AnnotationView::closeDocumentPanel() {
     documentPanel_ = nullptr;
     deferRemoveWidget(panel);
 
+    // 释放面板专属缩放热键，避免长期占用系统快捷键。
+    if (window_) {
+        window_->unregisterHotkey(HotkeyDocumentZoomIn);
+        window_->unregisterHotkey(HotkeyDocumentZoomInShift);
+        window_->unregisterHotkey(HotkeyDocumentZoomOut);
+        window_->unregisterHotkey(HotkeyDocumentZoomReset);
+    }
+
     if (toolbar_) toolbar_->setDocumentActive(false);
     canvas().markDirtyAll();
     updateHookPolicy();
@@ -1838,7 +1869,8 @@ void AnnotationView::closeDocumentPanel() {
 
 bool AnnotationView::pointOverDocumentPanel(const Vec2i& point) const {
     if (!documentPanel_) return false;
-    const Rect frame = documentPanel_->absoluteFrame();
+    // 面板是根视图的直接子控件，frame() 即客户区坐标；拖动当帧立即生效。
+    const Rect frame = documentPanel_->frame();
     return frame.w > 0 && frame.h > 0 && frame.contains(point);
 }
 
@@ -2070,8 +2102,10 @@ void AnnotationView::updateHookPolicy() {
         }
 
         // 文档面板同样需要吞掉左键与滚轮，保证拖动 / 缩放 / 滚动不泄漏。
+        // 用 frame()（父容器局部坐标 = 客户区）而不是 absoluteFrame()，
+        // 拖动后当帧就能同步吞键矩形，不会滞后一帧。
         if (documentPanel_) {
-            const Rect frame = documentPanel_->absoluteFrame();
+            const Rect frame = documentPanel_->frame();
             if (frame.w > 0 && frame.h > 0) {
                 cardRects[static_cast<size_t>(cardCount++)] =
                     Rect{frame.x + origin.x, frame.y + origin.y,

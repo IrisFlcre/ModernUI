@@ -40,6 +40,11 @@ enum HotkeyId : int {
     HotkeyNextPage = 5,
     HotkeyQuit = 6,
     HotkeyCopyOcr = 7,
+    // 文档面板打开期间动态注册：Ctrl + = / Ctrl + Shift + = / Ctrl + - / Ctrl + 0
+    HotkeyDocumentZoomIn = 8,
+    HotkeyDocumentZoomOut = 9,
+    HotkeyDocumentZoomReset = 10,
+    HotkeyDocumentZoomInShift = 11,
 };
 
 class AnnotationView : public modern_ui::View {

@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "Markdown.h"
 #include "Widget.h"
@@ -34,6 +36,12 @@ public:
     void setBounds(const modern_ui::Rect& bounds);
     void setLayer(int32_t layer);
 
+    // 正文字号缩放（1.0 = 100%）。Ctrl+ +/- / 双指捏合会调用。
+    void setZoom(float zoom);
+    void zoomBy(float delta);
+    void resetZoom();
+    float zoom() const { return zoom_; }
+
     std::function<void()> onClose;
     std::function<void()> onCopy;
     std::function<void(const modern_ui::Rect&)> onBoundsChanged;
@@ -43,6 +51,7 @@ public:
     void onLayout(const modern_ui::Rect& frame) override;
     bool onEvent(const modern_ui::Event& ev) override;
     void onStateChanged() override;
+    bool acceptsFocus() const override { return true; }
 
 private:
     enum class PressTarget : uint8_t { None = 0, Close, Copy };
@@ -53,11 +62,25 @@ private:
     void rebuildVisuals();
     void updateHover(const modern_ui::Vec2i& point);
     void updateMarkdownGeometry(int32_t panelWidth, int32_t panelHeight);
+    void applyZoomTheme();
+
+    // 事件坐标 → 视图客户区绝对坐标（与面板移动无关，用于稳定拖动）。
+    modern_ui::Vec2i absolutePoint(const modern_ui::Vec2i& localPoint) const;
+
+    void addTouchPoint(int32_t id, const modern_ui::Vec2i& point);
+    void moveTouchPoint(int32_t id, const modern_ui::Vec2i& point);
+    void removeTouchPoint(int32_t id);
+    void beginPinchIfReady();
+    void updatePinch();
+    float touchSpread() const;
+    bool handleZoomKey(const modern_ui::Event& ev);
 
     modern_ui::fluent::MarkdownView* markdown_ = nullptr;
+    modern_ui::fluent::MarkdownTheme baseTheme_{};
     uint32_t visualGroupId_ = 0;
     int32_t layer_ = -1060;
     std::string title_ = "文档解析";
+    float zoom_ = 1.0f;
 
     modern_ui::Rect headerRect_{};
     modern_ui::Rect closeRect_{};
@@ -67,12 +90,19 @@ private:
     bool closeHovered_ = false;
     bool copyHovered_ = false;
     bool gripHovered_ = false;
+    bool focusRing_ = false;
 
     bool dragging_ = false;
     bool resizing_ = false;
     PressTarget pressTarget_ = PressTarget::None;
-    modern_ui::Vec2i pressPoint_{};
+    modern_ui::Vec2i pressAbsolute_{};
     modern_ui::Rect startFrame_{};
+
+    // 触控：pointerId → 客户区坐标（最多保留两指用于捏合缩放）。
+    std::vector<std::pair<int32_t, modern_ui::Vec2i>> touches_;
+    bool pinching_ = false;
+    float pinchStartDistance_ = 0.0f;
+    float pinchStartZoom_ = 1.0f;
 };
 
 } // namespace annotation
