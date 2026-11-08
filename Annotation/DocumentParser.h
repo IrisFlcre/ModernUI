@@ -21,7 +21,8 @@ namespace annotation {
 // 文档还原系统提示词（强调"原文照录 + 只修复乱码"）。
 const char* documentParserSystemPrompt();
 
-// 把 OCR 行按阅读顺序拼成模型输入：行间 '\n'，检测到大段间距时插入空行提示分段。
+// 把 OCR 原始结果直接拼成模型输入：每行附带四边形坐标与置信度，
+// 不重排、不合并，让模型依据坐标自行分区与排序。
 std::string buildDocumentOcrPayload(int32_t screenWidth, int32_t screenHeight,
                                     const std::vector<OcrLine>& lines);
 
