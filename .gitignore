@@ -1,0 +1,49 @@
+# ============================================================================
+# ModernUI — Git ignore rules
+# ============================================================================
+
+# --- Build trees (framework, sub-projects, vendored dependencies) ---
+build/
+dist/
+
+# --- Compiler / linker outputs ---
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.dll.a
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# --- CMake / Ninja generated files ---
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+build.ninja
+.ninja_deps
+.ninja_log
+Makefile
+*.sln
+*.vcxproj
+*.vcxproj.*
+
+# --- Runtime secrets (DeepSeek API key, see README) ---
+API_KEY.txt
+
+# --- Editors and operating-system metadata ---
+.vscode/
+.idea/
+.vs/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# --- Logs and temporary files ---
+*.log
+*.tmp
+*.bak

@@ -1,0 +1,214 @@
+/* ==========================================================================
+   ModernUI style_demo — .css 样式表
+
+   控件由 C++ 定义，这里只描述"长什么样"：
+     - 标签选择器 Button / TextBlock / Card …
+     - 类选择器 .primary / .section / .title
+     - ID 选择器 #statusText
+     - 状态伪类 :hover / :pressed / :focus / :disabled
+     - var(--name) 变量 与 {entry} 引用
+   ========================================================================== */
+
+:root {
+    --bg: #10141b;
+    --surface: #171d26;
+    --surface-2: #1d2530;
+    --stroke: #ffffff1f;
+    --text: #eaf2ff;
+    --muted: #9aa7b8;
+    --accent: #6ee7b7;
+    --accent-hover: #9df5d0;
+    --accent-pressed: #3fc492;
+    --radius-card: 14px;
+}
+
+Card.root {
+    background: var(--bg);
+    border-width: 0;
+    border-color: transparent;
+    radius-card: 0;
+}
+
+Card.section {
+    background: var(--surface);
+    border-color: {stroke};
+    border-width: 1px;
+    radius-card: var(--radius-card);
+}
+
+TextBlock.title {
+    color: var(--text);
+    font-size: 26px;
+}
+
+TextBlock.hint {
+    color: var(--muted);
+}
+
+TextBlock.label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+Button {
+    control-height: 36px;
+    border-radius: 8px;
+}
+
+Button.primary {
+    background: var(--accent);
+    color: #08130d;
+    border-color: transparent;
+}
+
+Button.primary:hover {
+    background: var(--accent-hover);
+}
+
+Button.primary:pressed {
+    background: var(--accent-pressed);
+}
+
+Button:disabled {
+    background: #242c37;
+    color: #596575;
+    border-color: #ffffff12;
+}
+
+CheckBox {
+    color: var(--text);
+}
+
+ToggleSwitch {
+    color: var(--text);
+}
+
+Slider {
+    accent: var(--accent);
+}
+
+ProgressBar {
+    accent: var(--accent);
+}
+
+ProgressRing {
+    accent: var(--accent);
+}
+
+InfoBadge {
+    accent: var(--accent);
+}
+
+PipsPager {
+    accent: var(--accent);
+}
+
+ComboBox {
+    background: var(--surface-2);
+    border-color: {stroke};
+}
+
+ListView {
+    background: var(--surface-2);
+    border-color: {stroke};
+}
+
+TabView {
+    color: var(--muted);
+    accent: var(--accent);
+}
+
+#statusText {
+    color: var(--accent);
+    font-size: 15px;
+}
+
+/* 组合式控件内部的基础控件同样参与 .css 级联 */
+.calendar-nav {
+    border-radius: 14px;
+}
+
+.calendar-title {
+    color: var(--text);
+}
+
+.calendar-weekday {
+    color: var(--muted);
+}
+
+.calendar-day {
+    border-radius: 15px;
+}
+
+.tree-row {
+    border-radius: 6px;
+}
+
+/* --------------------------------------------------------------------------
+   扩展控件：新控件同样参与级联
+   -------------------------------------------------------------------------- */
+
+SegmentedControl {
+    accent: var(--accent);
+    control-height: 38px;
+    border-radius: 19px;
+}
+
+RangeSlider {
+    accent: var(--accent);
+}
+
+Chip {
+    color: var(--text);
+    accent: var(--accent);
+}
+
+RadialGauge {
+    accent: var(--accent);
+}
+
+Sparkline {
+    accent: var(--accent);
+}
+
+/* --------------------------------------------------------------------------
+   CSS 布局：padding / margin / gap / width / height / flex 也能写在样式表里
+   （优先级在 .ui 属性之后，可用来做主题化的尺寸覆盖）
+   -------------------------------------------------------------------------- */
+
+#cssLayoutCard {
+    padding: 20px;
+}
+
+.css-row {
+    width: 100%;
+    gap: 16px;
+}
+
+.skeleton-stack {
+    width: 220px;
+    gap: 10px;
+}
+
+.skeleton-line {
+    width: 100%;
+    height: 14px;
+}
+
+.skeleton-line.short {
+    width: 68%;
+}
+
+.skeleton-line.tiny {
+    width: 42%;
+}
+
+.chart {
+    flex-grow: 1;
+    min-width: 220px;
+}
+
+/* CSS opacity → 控件合成 Group 的整体不透明度 */
+.subdued {
+    opacity: 0.55;
+}

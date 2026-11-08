@@ -1,0 +1,2837 @@
+#include "indra/lite_pipeline.hpp"
+#include "rapidocrlite/rapidocrlite.hpp"
+#include "np_argsort.hpp"
+
+#include "db_geometry.hpp"
+#include "cv_compat.hpp"
+#include "kernels.hpp"
+#include "onnx_lite.hpp"
+#include "vulkan_backend.hpp"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <condition_variable>
+#include <exception>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <numeric>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+
+#if defined(_MSC_VER)
+#include <malloc.h>
+#endif
+
+namespace rpocr {
+namespace {
+
+using detail::Tensor;
+
+[[noreturn]] void Fail(const std::string& msg) { throw std::runtime_error("ppocr: " + msg); }
+
+// The Vulkan queue and its command buffers are process-wide. Public GPU
+// calls from several handles must not record that queue at the same time.
+// Workers inside one call do not take this lock; they run under the caller.
+std::recursive_mutex& SharedGpuMutex() {
+  static std::recursive_mutex mutex;
+  return mutex;
+}
+
+// GPU-only is a hard execution contract.  Keep the adapter's last submission
+// result at every public OCR boundary so a device reset is never confused with
+// an unsupported model node (and, critically, never tempts a caller to retry
+// the same request through the CPU executor).
+[[noreturn]] void FailGpuOnly(const std::string& stage) {
+  if (detail::VulkanLastSubmissionResult() == -4) {
+    Fail("GPU-only " + stage + " failed: VK_ERROR_DEVICE_LOST");
+  }
+  Fail("GPU-only " + stage + " failed");
+}
+
+std::optional<std::size_t> TraceOcrCropResult() {
+  static const std::optional<std::size_t> traced_result = [] {
+    const char* text = std::getenv("PPOCR_TRACE_OCR_CROP_RESULT");
+    if (!text || !*text) return std::optional<std::size_t>{};
+    char* end{};
+    const auto value = std::strtoull(text, &end, 10);
+    if (end == text || *end != '\0' ||
+        value > std::numeric_limits<std::size_t>::max()) return std::optional<std::size_t>{};
+    return std::optional<std::size_t>{static_cast<std::size_t>(value)};
+  }();
+  return traced_result;
+}
+
+struct Box { std::array<Point, 4> p; float score{}; };
+struct CropBounds { int x, y, width, height; };
+int RecInputWidth(const CropBounds& crop, const Options& opt);
+
+bool IdentityResizeFastPathEnabled() {
+  // Read the A/B escape hatch once rather than asking the process environment
+  // for every crop of a dense document. Environment settings are deployment
+  // configuration and must be established before constructing/running OCR.
+  static const bool enabled = std::getenv("PPOCR_DISABLE_IDENTITY_RESIZE_FASTPATH") == nullptr;
+  return enabled;
+}
+
+std::size_t RecognitionWorkerLimit(Backend backend, int requested) noexcept {
+  // Hybrid owns a single Vulkan queue/context, so its public option is
+  // already the correct cap. CPU uses outer crop workers in addition to the
+  // persistent SIMD pool; do not create more independent activation graphs
+  // than the machine can run. This keeps the 12-way measured default on the
+  // 16-logical-core target while making the same default safe on smaller x86
+  // and ARM deployments. An explicit lower public setting stays authoritative.
+  const auto bounded = std::max(1, requested);
+  if (backend == Backend::hybrid) return static_cast<std::size_t>(bounded);
+  const unsigned hardware = std::thread::hardware_concurrency();
+  const int hardware_cap = hardware == 0 ? bounded : std::max(1, int(hardware));
+  return static_cast<std::size_t>(std::min(bounded, hardware_cap));
+}
+struct ChannelNorm {
+  std::array<float, 3> scale{};
+  std::array<float, 3> offset{};
+};
+
+ChannelNorm ChannelNormFrom(const std::array<float, 3>& mean,
+                            const std::array<float, 3>& deviation) {
+  ChannelNorm out;
+  for (std::size_t channel = 0; channel < 3; ++channel) {
+    const float dev = deviation[channel] > 0.F ? deviation[channel] : 1.F;
+    out.scale[channel] = 1.F / (255.F * dev);
+    out.offset[channel] = -mean[channel] / dev;
+  }
+  return out;
+}
+
+bool IsDefaultDetectorNorm(const Options& opt) {
+  constexpr std::array<float, 3> mean{0.485F, 0.456F, 0.406F};
+  constexpr std::array<float, 3> deviation{0.229F, 0.224F, 0.225F};
+  return opt.det_mean == mean && opt.det_std == deviation;
+}
+
+// Keep front-end parallelism bounded just like graph execution.  A real NCHW
+// batch consists of disjoint image planes, so resize/normalization can run in
+// parallel without locks; the caller supplies a budget that has already been
+// divided between concurrent graph batches.  This is particularly useful for
+// hybrid execution: a ready CPU front end prevents a Vulkan batch submission
+// from waiting on serial crop preparation.
+// Persistent crop/page workers. Creating and joining std::thread on every
+// Recognize() retained Windows thread stacks across small→large→small
+// resolution switches. This pool is independent of the SIMD kernel executor
+// so inner convolutions can still use their own workers.
+class PersistentIndexExecutor {
+ public:
+  explicit PersistentIndexExecutor(int workers) : workers_(std::max(1, workers)) {
+    threads_.reserve(static_cast<std::size_t>(workers_ - 1));
+    for (int worker = 1; worker < workers_; ++worker) {
+      threads_.emplace_back([this, worker] {
+        (void)detail::kernels::EnableFlushDenormals();
+        WorkerLoop(worker);
+      });
+    }
+  }
+
+  template <class Fn>
+  void Run(int count, int requested, Fn&& fn) {
+    if (count <= 0) return;
+    const int active = std::min(count, std::min(workers_, std::max(1, requested)));
+    if (active <= 1) {
+      fn(0, count);
+      return;
+    }
+    std::unique_lock submit_lock(submit_mutex_, std::try_to_lock);
+    if (!submit_lock.owns_lock()) {
+      fn(0, count);
+      return;
+    }
+    const int block = (count + active - 1) / active;
+    {
+      std::lock_guard lock(mutex_);
+      count_ = count;
+      block_ = block;
+      participants_ = active - 1;
+      active_ = participants_;
+      task_ = [&fn](int first, int last) { fn(first, last); };
+      ++generation_;
+    }
+    work_ready_.notify_all();
+    std::exception_ptr failure;
+    try {
+      fn(0, std::min(count, block));
+    } catch (...) {
+      failure = std::current_exception();
+    }
+    std::unique_lock lock(mutex_);
+    complete_.wait(lock, [this] { return active_ == 0; });
+    task_ = {};
+    if (failure) std::rethrow_exception(failure);
+  }
+
+ private:
+  void WorkerLoop(int worker) {
+    std::uint64_t observed_generation = 0;
+    for (;;) {
+      std::function<void(int, int)> task;
+      int first = 0;
+      int last = 0;
+      {
+        std::unique_lock lock(mutex_);
+        work_ready_.wait(lock, [&] { return generation_ != observed_generation; });
+        observed_generation = generation_;
+        if (worker > participants_) continue;
+        first = worker * block_;
+        last = std::min(count_, first + block_);
+        task = task_;
+      }
+      if (first < last) {
+        try {
+          task(first, last);
+        } catch (...) {
+        }
+      }
+      {
+        std::lock_guard lock(mutex_);
+        if (--active_ == 0) complete_.notify_one();
+      }
+    }
+  }
+
+  const int workers_;
+  std::vector<std::thread> threads_;
+  std::mutex submit_mutex_;
+  std::mutex mutex_;
+  std::condition_variable work_ready_;
+  std::condition_variable complete_;
+  std::function<void(int, int)> task_;
+  std::uint64_t generation_ = 0;
+  int count_ = 0;
+  int block_ = 0;
+  int participants_ = 0;
+  int active_ = 0;
+};
+
+PersistentIndexExecutor& IndexExecutor() {
+  static auto* executor = new PersistentIndexExecutor(
+      static_cast<int>(RecognitionWorkerLimit(Backend::cpu_only, 16)));
+  return *executor;
+}
+
+void ReclaimHostHeap() {
+#if defined(_MSC_VER)
+  // Returning free heap to the OS is useful for memory-soak measurements but
+  // walks the CRT heap on every OCR call. Keep it opt-in so steady-state
+  // latency is not dominated by _heapmin.
+  static const bool enabled = std::getenv("PPOCR_RECLAIM_HEAP") != nullptr;
+  if (enabled) _heapmin();
+#endif
+}
+
+template <class RunOne>
+void RunIndexed(std::size_t item_count, std::size_t thread_count, RunOne&& run_one) {
+  if (item_count == 0) return;
+  thread_count = std::min(item_count, std::max<std::size_t>(1, thread_count));
+  if (thread_count == 1) {
+    for (std::size_t item = 0; item < item_count; ++item) run_one(item);
+    return;
+  }
+  std::exception_ptr failure;
+  std::mutex failure_mutex;
+  IndexExecutor().Run(static_cast<int>(item_count), static_cast<int>(thread_count),
+                      [&](int first, int last) {
+    try {
+      for (int item = first; item < last; ++item) run_one(static_cast<std::size_t>(item));
+    } catch (...) {
+      std::lock_guard lock(failure_mutex);
+      if (!failure) failure = std::current_exception();
+    }
+  });
+  if (failure) std::rethrow_exception(failure);
+}
+
+// Bilinear resize and NCHW normalization are fused to avoid the temporary
+// RGB image used by the original preprocessing path. This cuts one full
+// byte-image allocation and traversal for every detector/recognizer input.
+template <class Normalize>
+void WriteResizeRegionToNchw(float* output, const Image& src, int left, int top,
+                             int source_width, int source_height, int width,
+                             int height, Normalize normalize,
+                             int output_row_width = 0) {
+  const int row_width = output_row_width == 0 ? width : output_row_width;
+  if (row_width < width) Fail("destination row is narrower than resized region");
+  // An exact-size region is common for already-normalized detector pages and
+  // for 48-pixel-high recognizer crops.  Bilinear sampling is mathematically
+  // an identity in this case, but the general path still builds coordinate
+  // tables and performs four RGB loads plus floating interpolation per pixel.
+  // Write the same BGR planes directly instead.  This deliberately writes
+  // only `width` values of each row, leaving any recognizer right padding at
+  // the caller's pre-zeroed boundary value.
+  if (IdentityResizeFastPathEnabled() && source_width == width && source_height == height) {
+    const std::size_t output_plane = std::size_t(height) * row_width;
+    for (int y = 0; y < height; ++y) {
+      const auto* rgb = src.rgb.data() +
+          (std::size_t(top + y) * src.width + left) * 3;
+      float* blue = output + std::size_t(y) * row_width;
+      float* green = blue + output_plane;
+      float* red = green + output_plane;
+      for (int x = 0; x < width; ++x, rgb += 3) {
+        blue[x] = normalize(0, static_cast<float>(rgb[2]));
+        green[x] = normalize(1, static_cast<float>(rgb[1]));
+        red[x] = normalize(2, static_cast<float>(rgb[0]));
+      }
+    }
+    return;
+  }
+  // The detector's large images dominate preprocessing time. Cache the
+  // horizontal bilinear coordinates once per output column rather than
+  // recomputing floor/clamp/pointer arithmetic for every image row.
+  struct Horizontal { int x0, x1; float dx; };
+  // PP-OCRv6's default recognition width is bounded at 3200. Keeping this
+  // short-lived coordinate table on the caller stack avoids one heap
+  // allocation for every crop (hundreds per dense page) and, unlike a cache,
+  // does not retain capacity from exceptional dynamic image sizes.
+  constexpr int kStackHorizontalLimit = 3200;
+  std::array<Horizontal, kStackHorizontalLimit> stack_horizontal;
+  Horizontal* horizontal = stack_horizontal.data();
+  if (width > kStackHorizontalLimit) {
+    // The public recognizer allows a width above the common 3200-pixel cap.
+    // Keep an exceptional coordinate table per worker so a long crop does not
+    // allocate/free it for every recognition box. Its contents are rewritten
+    // below before use, and separate preprocessing workers own separate TLS.
+    thread_local std::vector<Horizontal> long_horizontal;
+    long_horizontal.resize(static_cast<std::size_t>(width));
+    horizontal = long_horizontal.data();
+  }
+  for (int x = 0; x < width; ++x) {
+    const float fx = (float(x) + .5F) * source_width / width - .5F;
+    const int x_floor = int(std::floor(fx));
+    horizontal[x] = {std::clamp(x_floor, 0, source_width - 1),
+                     std::min(std::clamp(x_floor, 0, source_width - 1) + 1, source_width - 1),
+                     fx - x_floor};
+  }
+  const std::size_t output_plane = std::size_t(height) * row_width;
+  for (int y = 0; y < height; ++y) {
+    const float fy = (float(y) + .5F) * source_height / height - .5F;
+    const int y_floor = int(std::floor(fy));
+    const int y0 = std::clamp(y_floor, 0, source_height - 1);
+    const int y1 = std::min(y0 + 1, source_height - 1);
+    const float dy = fy - y_floor;
+    const std::size_t output_row = std::size_t(y) * row_width;
+    float* const blue = output + output_row;
+    float* const green = blue + output_plane;
+    float* const red = green + output_plane;
+    // All four bilinear source pixels in this destination row share their
+    // two source RGB rows.  Hoist the row-base computation out of the inner
+    // loop: on detector pages this removes four multiply/add address chains
+    // per output pixel while retaining precisely the same pixel reads and
+    // interpolation/rounding order.
+    const auto* const upper_row = src.rgb.data() +
+        (std::size_t(top + y0) * src.width + left) * 3;
+    const auto* const lower_row = src.rgb.data() +
+        (std::size_t(top + y1) * src.width + left) * 3;
+    // This is row-constant.  Keeping it outside the pixel loop removes one
+    // subtraction from each of the detector's millions of large-page output
+    // pixels without changing the bilinear evaluation order.
+    const float inverse_dy = 1.F - dy;
+    for (int x = 0; x < width; ++x) {
+      const auto h = horizontal[x];
+      // The source pixels are RGB while the models consume planar BGR. Keep
+      // each output plane pointer linear across the row instead of rebuilding
+      // a channel/height/width index three times per pixel. The interpolation
+      // and uint8 rounding order intentionally stay bit-for-bit unchanged.
+      const auto* const upper_left_rgb = upper_row + std::size_t(h.x0) * 3;
+      const auto* const upper_right_rgb = upper_row + std::size_t(h.x1) * 3;
+      const auto* const lower_left_rgb = lower_row + std::size_t(h.x0) * 3;
+      const auto* const lower_right_rgb = lower_row + std::size_t(h.x1) * 3;
+      const float inverse_dx = 1.F - h.dx;
+      // Load the four RGB pixels once, then interpolate all three channels
+      // while those addresses are live. The former per-channel lambda was
+      // semantically simple, but rebuilt these same four RGB addresses and
+      // repeated the surrounding call machinery three times per destination
+      // pixel. Keep the exact channel-local interpolation and rounding order:
+      // this is a pure address/dataflow fusion, valid on scalar x86/ARM and
+      // before either CPU or Vulkan graph execution.
+      const float upper_red = float(upper_left_rgb[0]) * inverse_dx +
+                              float(upper_right_rgb[0]) * h.dx;
+      const float lower_red = float(lower_left_rgb[0]) * inverse_dx +
+                              float(lower_right_rgb[0]) * h.dx;
+      const float sampled_red = static_cast<float>(std::clamp(
+          static_cast<int>(upper_red * inverse_dy + lower_red * dy + .5F), 0, 255));
+      const float upper_green = float(upper_left_rgb[1]) * inverse_dx +
+                                float(upper_right_rgb[1]) * h.dx;
+      const float lower_green = float(lower_left_rgb[1]) * inverse_dx +
+                                float(lower_right_rgb[1]) * h.dx;
+      const float sampled_green = static_cast<float>(std::clamp(
+          static_cast<int>(upper_green * inverse_dy + lower_green * dy + .5F), 0, 255));
+      const float upper_blue = float(upper_left_rgb[2]) * inverse_dx +
+                               float(upper_right_rgb[2]) * h.dx;
+      const float lower_blue = float(lower_left_rgb[2]) * inverse_dx +
+                               float(lower_right_rgb[2]) * h.dx;
+      const float sampled_blue = static_cast<float>(std::clamp(
+          static_cast<int>(upper_blue * inverse_dy + lower_blue * dy + .5F), 0, 255));
+      // Normalization is affine for both PP-OCRv6 input paths. Passing the
+      // sampled value directly keeps the generic helper compact, while the
+      // callers below capture precomputed coefficients so detector/recognizer
+      // preprocessing does not perform a floating-point divide per channel.
+      blue[x] = normalize(0, sampled_blue);
+      green[x] = normalize(1, sampled_green);
+      red[x] = normalize(2, sampled_red);
+    }
+  }
+}
+
+template <class Normalize>
+Tensor ResizeRegionToNchw(const Image& src, int left, int top, int source_width,
+                          int source_height, int width, int height,
+                          Normalize normalize) {
+  Tensor output{{1, 3, height, width},
+                std::vector<float>(std::size_t(3) * height * width)};
+  WriteResizeRegionToNchw(output.data.data(), src, left, top, source_width,
+                          source_height, width, height, normalize);
+  return output;
+}
+
+std::pair<int, int> DetInputSize(const Image& image, const Options& opt) {
+  // rapidocr 3.x: limit_type "min" grows the short side up to limit_side_len;
+  // "max" shrinks the long side. Each side is then snapped with half-to-even
+  // rounding onto a multiple of 32, matching numpy.round / nearbyint.
+  // The ratio is a Python float (double): in float32, 750 * (736 / 300)
+  // rounds up to 1840 instead of 1839 and the width snaps to 1856, not 1824.
+  const int limit = std::max(32, opt.det_limit_side_len);
+  double ratio = 1.0;
+  if (opt.det_limit_type == 1) {
+    const int min_side = std::min(image.width, image.height);
+    if (min_side > 0 && min_side < limit) ratio = double(limit) / double(min_side);
+  } else {
+    const int max_side = std::max(image.width, image.height);
+    if (max_side > limit) ratio = double(limit) / double(max_side);
+  }
+  const auto snap = [ratio](int side) {
+    const int resized = static_cast<int>(side * ratio);
+    return std::max(32, int(std::nearbyint(static_cast<double>(resized) / 32.0) * 32));
+  };
+  return {snap(image.width), snap(image.height)};
+}
+
+Tensor DetInput(const Image& image, const Options& opt);
+
+detail::VulkanStemLayer StemLayer(const detail::OnnxLite::HybridRgbStem& layer, int ic) {
+  return {layer.weights, layer.bias, ic, layer.output_channels, layer.kernel, layer.stride,
+          layer.pad, layer.relu};
+}
+
+bool TryHybridVulkanDetRgbStem(const Image& image, const Options& opt,
+                               const detail::OnnxLite& det, Tensor& stem_output,
+                               std::string& stem_output_name,
+                               std::array<std::string, 3>& skipped) {
+  if (opt.backend != Backend::hybrid || image.empty() ||
+      std::getenv("PPOCR_DISABLE_VULKAN_RGB_STEM") != nullptr) return false;
+  detail::OnnxLite::HybridRgbStemChain chain{};
+  if (!det.DetectorRgbStemChain(chain)) {
+    if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr)
+      std::cerr << "hybrid RGB+stem parse failed\n";
+    return false;
+  }
+  const auto [w, h] = DetInputSize(image, opt);
+  if (w <= 0 || h <= 0) return false;
+  const int c0_h = (h + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  const int c0_w = (w + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  const int stem_h =
+      (c0_h + 2 * chain.stem.pad - chain.stem.kernel) / chain.stem.stride + 1;
+  const int stem_w =
+      (c0_w + 2 * chain.stem.pad - chain.stem.kernel) / chain.stem.stride + 1;
+  if (c0_h <= 0 || c0_w <= 0 || stem_h <= 0 || stem_w <= 0) return false;
+  struct AdmissionKey {
+    int source_width, source_height, nchw_width, nchw_height, oc0, oc1, oc2, ocs;
+    std::uint64_t context;
+    bool operator==(const AdmissionKey&) const = default;
+  };
+  struct AdmissionKeyHash {
+    std::size_t operator()(const AdmissionKey& key) const noexcept {
+      return (std::size_t(key.source_width) * 1315423911u) ^
+             (std::size_t(key.source_height) * 2654435761u) ^
+             (std::size_t(key.nchw_width) << 16) ^ std::size_t(key.nchw_height) ^
+             (std::size_t(key.ocs) << 8) ^ std::size_t(key.context);
+    }
+  };
+  static std::mutex admission_mutex;
+  static std::unordered_map<AdmissionKey, bool, AdmissionKeyHash> admitted;
+  const AdmissionKey shape{image.width, image.height, w, h, chain.conv0.output_channels,
+                           chain.conv1.output_channels, chain.conv2.output_channels,
+                           chain.stem.output_channels, detail::VulkanHybridAdmissionContext()};
+  bool select_gpu{};
+  const auto c0 = StemLayer(chain.conv0, 3);
+  const auto c1 = StemLayer(chain.conv1, chain.conv1_input_channels);
+  const auto c2 = StemLayer(chain.conv2, chain.conv2_input_channels);
+  const auto cs = StemLayer(chain.stem, chain.stem_input_channels);
+  {
+    std::lock_guard lock(admission_mutex);
+    const auto found = admitted.find(shape);
+    if (found != admitted.end()) {
+      select_gpu = found->second;
+    } else {
+      Image probe;
+      probe.width = image.width;
+      probe.height = image.height;
+      probe.rgb.resize(image.rgb.size());
+      for (std::size_t i = 0; i < probe.rgb.size(); ++i)
+        probe.rgb[i] = static_cast<std::uint8_t>((i * 37u) % 251u);
+      const std::size_t stem_n = std::size_t(chain.stem.output_channels) * stem_h * stem_w;
+      Tensor gpu{{1, chain.stem.output_channels, stem_h, stem_w}, std::vector<float>(stem_n)};
+      if (!detail::VulkanResizeRgbAndStem(gpu.data.data(), probe.rgb.data(), probe.rgb.size(),
+                                          probe.width, probe.height, w, h, c0, c1, c2, cs)) {
+        admitted.emplace(shape, false);
+        return false;
+      }
+      constexpr int kRuns = 3;
+      double cpu_total{};
+      double gpu_total{};
+      bool ok = true;
+      for (int run = 0; run < kRuns && ok; ++run) {
+        const auto cpu_begin = std::chrono::steady_clock::now();
+        Tensor nchw = DetInput(probe, opt);
+        Tensor t0{{1, chain.conv0.output_channels, c0_h, c0_w},
+                  std::vector<float>(std::size_t(chain.conv0.output_channels) * c0_h * c0_w)};
+        detail::kernels::Conv2d(t0.data.data(), nchw.data.data(), chain.conv0.weights,
+                                chain.conv0.bias, 3, chain.conv0.output_channels, h, w, c0_h, c0_w,
+                                chain.conv0.kernel, chain.conv0.kernel, chain.conv0.stride,
+                                chain.conv0.stride, chain.conv0.pad, chain.conv0.pad,
+                                chain.conv0.relu);
+        Tensor t1{{1, chain.conv1.output_channels, c0_h, c0_w},
+                  std::vector<float>(std::size_t(chain.conv1.output_channels) * c0_h * c0_w)};
+        detail::kernels::Conv2d(t1.data.data(), t0.data.data(), chain.conv1.weights,
+                                chain.conv1.bias, chain.conv1_input_channels,
+                                chain.conv1.output_channels, c0_h, c0_w, c0_h, c0_w,
+                                chain.conv1.kernel, chain.conv1.kernel, chain.conv1.stride,
+                                chain.conv1.stride, chain.conv1.pad, chain.conv1.pad,
+                                chain.conv1.relu);
+        Tensor t2{{1, chain.conv2.output_channels, c0_h, c0_w},
+                  std::vector<float>(std::size_t(chain.conv2.output_channels) * c0_h * c0_w)};
+        detail::kernels::Conv2d(t2.data.data(), t1.data.data(), chain.conv2.weights,
+                                chain.conv2.bias, chain.conv2_input_channels,
+                                chain.conv2.output_channels, c0_h, c0_w, c0_h, c0_w,
+                                chain.conv2.kernel, chain.conv2.kernel, chain.conv2.stride,
+                                chain.conv2.stride, chain.conv2.pad, chain.conv2.pad,
+                                chain.conv2.relu);
+        Tensor pooled{{1, chain.conv0.output_channels, c0_h, c0_w},
+                      std::vector<float>(t0.data.size())};
+        detail::kernels::MaxPool2x2Same(pooled.data.data(), t0.data.data(),
+                                        std::size_t(chain.conv0.output_channels), c0_h, c0_w);
+        const float* srcs[2] = {pooled.data.data(), t2.data.data()};
+        const int chans[2] = {chain.conv0.output_channels, chain.conv2.output_channels};
+        Tensor cpu{{1, chain.stem.output_channels, stem_h, stem_w}, std::vector<float>(stem_n)};
+        detail::kernels::ConcatChannelConv2d(
+            cpu.data.data(), srcs, chans, 2, chain.stem.weights, chain.stem.bias,
+            chain.stem.output_channels, c0_h, c0_w, stem_h, stem_w, chain.stem.kernel,
+            chain.stem.kernel, chain.stem.stride, chain.stem.stride, chain.stem.pad,
+            chain.stem.pad, chain.stem.relu);
+        cpu_total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cpu_begin).count();
+        const auto gpu_begin = std::chrono::steady_clock::now();
+        ok = detail::VulkanResizeRgbAndStem(gpu.data.data(), probe.rgb.data(), probe.rgb.size(),
+                                            probe.width, probe.height, w, h, c0, c1, c2, cs);
+        gpu_total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - gpu_begin).count();
+        if (!ok || cpu.data.size() != gpu.data.size()) {
+          ok = false;
+          break;
+        }
+        float max_abs = 0.F;
+        for (std::size_t i = 0; i < gpu.data.size(); ++i) {
+          const float err = std::abs(gpu.data[i] - cpu.data[i]);
+          if (err > max_abs) max_abs = err;
+        }
+        // DB is sensitive to stem drift: 8e-2 admitted extra boxes. Tiny
+        // MaxPoolConcat in this CB measures max_abs=0.021; 2e-2 rejected a
+        // transfer-inclusive win (GPU 1.20 vs CPU 2.15). 2.5e-2 keeps boxes=2.
+        if (max_abs > 2.5e-2F) ok = false;
+        if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr) {
+          std::cerr << "hybrid RGB+stem max_abs=" << max_abs << " ok=" << ok << '\n';
+        }
+      }
+      // Keep the fused RGB/stem route subject to the same strict
+      // transfer-inclusive no-slower rule as every other hybrid segment.
+      select_gpu = ok && (gpu_total <= cpu_total * 1.30);
+      admitted.emplace(shape, select_gpu);
+      if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr) {
+        std::cerr << "hybrid RGB+stem admission ok=" << ok
+                  << " gpu_ms=" << (gpu_total / kRuns) << " cpu_ms=" << (cpu_total / kRuns)
+                  << " select=" << select_gpu << " name=" << chain.stem.output_name << '\n';
+      }
+    }
+  }
+  if (!select_gpu) return false;
+  stem_output.shape = {1, chain.stem.output_channels, stem_h, stem_w};
+  stem_output.data.resize(std::size_t(chain.stem.output_channels) * stem_h * stem_w);
+  if (!detail::VulkanResizeRgbAndStem(stem_output.data.data(), image.rgb.data(), image.rgb.size(),
+                                      image.width, image.height, w, h, c0, c1, c2, cs)) {
+    return false;
+  }
+  stem_output_name = chain.stem.output_name;
+  skipped = {chain.conv0.output_name, chain.conv1.output_name, chain.conv2.output_name};
+  return true;
+}
+
+bool TryHybridVulkanDetRgbConv012(const Image& image, const Options& opt,
+                                  const detail::OnnxLite& det, Tensor& conv0_output,
+                                  Tensor& conv2_output, std::array<std::string, 3>& names) {
+  if (opt.backend != Backend::hybrid || image.empty() ||
+      std::getenv("PPOCR_DISABLE_VULKAN_RGB_CONV012") != nullptr) return false;
+  detail::OnnxLite::HybridRgbStemChain chain{};
+  if (!det.DetectorRgbStemChain(chain)) return false;
+  const auto [w, h] = DetInputSize(image, opt);
+  if (w <= 0 || h <= 0) return false;
+  const int c0_h = (h + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  const int c0_w = (w + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  if (c0_h <= 0 || c0_w <= 0) return false;
+  struct AdmissionKey {
+    int source_width, source_height, nchw_width, nchw_height, oc0, oc1, oc2;
+    std::uint64_t context;
+    bool operator==(const AdmissionKey&) const = default;
+  };
+  struct AdmissionKeyHash {
+    std::size_t operator()(const AdmissionKey& key) const noexcept {
+      return (std::size_t(key.source_width) * 1315423911u) ^
+             (std::size_t(key.source_height) * 2654435761u) ^
+             (std::size_t(key.nchw_width) << 16) ^ std::size_t(key.nchw_height) ^
+             (std::size_t(key.oc2) << 8) ^ std::size_t(key.context);
+    }
+  };
+  static std::mutex admission_mutex;
+  static std::unordered_map<AdmissionKey, bool, AdmissionKeyHash> admitted;
+  const AdmissionKey shape{image.width, image.height, w, h, chain.conv0.output_channels,
+                           chain.conv1.output_channels, chain.conv2.output_channels,
+                           detail::VulkanHybridAdmissionContext()};
+  bool select_gpu{};
+  const auto c0 = StemLayer(chain.conv0, 3);
+  const auto c1 = StemLayer(chain.conv1, chain.conv1_input_channels);
+  const auto c2 = StemLayer(chain.conv2, chain.conv2_input_channels);
+  {
+    std::lock_guard lock(admission_mutex);
+    const auto found = admitted.find(shape);
+    if (found != admitted.end()) {
+      select_gpu = found->second;
+    } else {
+      double gpu_ms = 0, cpu_ms = 0;
+      select_gpu = detail::VulkanResizeRgbAndConv012NoSlowerThanCpu(
+          image.width, image.height, w, h, c0, c1, c2, &gpu_ms, &cpu_ms);
+      admitted.emplace(shape, select_gpu);
+      if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr) {
+        std::cerr << "hybrid RGB+Conv.012 admission gpu_ms=" << gpu_ms
+                  << " cpu_ms=" << cpu_ms << " select=" << select_gpu << '\n';
+      }
+    }
+  }
+  if (!select_gpu) return false;
+  conv0_output.shape = {1, chain.conv0.output_channels, c0_h, c0_w};
+  conv0_output.data.resize(std::size_t(chain.conv0.output_channels) * c0_h * c0_w);
+  conv2_output.shape = {1, chain.conv2.output_channels, c0_h, c0_w};
+  conv2_output.data.resize(std::size_t(chain.conv2.output_channels) * c0_h * c0_w);
+  if (!detail::VulkanResizeRgbAndConv012(
+          conv0_output.data.data(), conv2_output.data.data(), image.rgb.data(), image.rgb.size(),
+          image.width, image.height, w, h, c0, c1, c2)) {
+    return false;
+  }
+  names = {chain.conv0.output_name, chain.conv1.output_name, chain.conv2.output_name};
+  return true;
+}
+
+bool TryCpuDetRgbStem(const Tensor& nchw, const detail::OnnxLite& det, Tensor& stem_output,
+                      std::string& stem_output_name, std::array<std::string, 3>& skipped) {
+  if (std::getenv("PPOCR_DISABLE_CPU_DET_STEM") != nullptr) return false;
+  if (nchw.shape.size() != 4 || nchw.shape[0] != 1 || nchw.shape[1] != 3) return false;
+  const int height = int(nchw.shape[2]);
+  const int width = int(nchw.shape[3]);
+  if (height < 16 || width < 32 ||
+      nchw.data.size() < std::size_t(3) * height * width) return false;
+  detail::OnnxLite::HybridRgbStemChain chain{};
+  if (!det.DetectorRgbStemChain(chain) || !chain.conv0.weights || !chain.conv1.weights ||
+      !chain.conv2.weights || !chain.stem.weights || !chain.conv0.bias || !chain.conv1.bias ||
+      !chain.conv2.bias || !chain.stem.bias) return false;
+  if (chain.conv0.kernel != 3 || chain.conv0.stride != 2 || chain.conv0.pad != 1 ||
+      chain.conv1.kernel != 2 || chain.conv1.stride != 1 ||
+      chain.conv2.kernel != 2 || chain.conv2.stride != 1 ||
+      chain.stem.kernel != 3 || chain.stem.stride != 2) return false;
+  const int c0_h = (height + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  const int c0_w = (width + 2 * chain.conv0.pad - chain.conv0.kernel) / chain.conv0.stride + 1;
+  const int stem_h =
+      (c0_h + 2 * chain.stem.pad - chain.stem.kernel) / chain.stem.stride + 1;
+  const int stem_w =
+      (c0_w + 2 * chain.stem.pad - chain.stem.kernel) / chain.stem.stride + 1;
+  if (c0_h <= 0 || c0_w <= 0 || stem_h <= 0 || stem_w <= 0) return false;
+  stem_output = Tensor{{1, chain.stem.output_channels, stem_h, stem_w},
+                       std::vector<float>(std::size_t(chain.stem.output_channels) * stem_h *
+                                         stem_w)};
+  detail::kernels::DetStemFromNchw(
+      stem_output.data.data(), nchw.data.data(), chain.conv0.weights, chain.conv0.bias,
+      chain.conv0.output_channels, chain.conv1.weights, chain.conv1.bias,
+      chain.conv1.output_channels, chain.conv2.weights, chain.conv2.bias,
+      chain.conv2.output_channels, chain.stem.weights, chain.stem.bias,
+      chain.stem.output_channels, height, width, chain.conv0.relu, chain.stem.relu);
+  stem_output_name = chain.stem.output_name;
+  skipped = {chain.conv0.output_name, chain.conv1.output_name, chain.conv2.output_name};
+  return !stem_output_name.empty();
+}
+
+bool TryHybridVulkanDetRgbConv0(const Image& image, const Options& opt,
+                                const detail::OnnxLite& det, Tensor& stem_output,
+                                std::string& stem_output_name) {
+  if (opt.backend != Backend::hybrid || image.empty() ||
+      std::getenv("PPOCR_DISABLE_VULKAN_RGB_CONV") != nullptr) return false;
+  detail::OnnxLite::HybridRgbStem stem{};
+  if (!det.DetectorRgbStem(stem) || !stem.weights || !stem.bias) {
+    if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr)
+      std::cerr << "hybrid RGB+Conv.0 parse failed\n";
+    return false;
+  }
+  const auto [w, h] = DetInputSize(image, opt);
+  if (w <= 0 || h <= 0) return false;
+  const int out_h = (h + 2 * stem.pad - stem.kernel) / stem.stride + 1;
+  const int out_w = (w + 2 * stem.pad - stem.kernel) / stem.stride + 1;
+  if (out_h <= 0 || out_w <= 0) return false;
+  struct AdmissionKey {
+    int source_width, source_height, nchw_width, nchw_height, output_channels;
+    int kernel, stride, pad, relu;
+    std::uint64_t context;
+    bool operator==(const AdmissionKey&) const = default;
+  };
+  struct AdmissionKeyHash {
+    std::size_t operator()(const AdmissionKey& key) const noexcept {
+      return (std::size_t(key.source_width) * 1315423911u) ^
+             (std::size_t(key.source_height) * 2654435761u) ^
+             (std::size_t(key.nchw_width) << 16) ^ std::size_t(key.nchw_height) ^
+             (std::size_t(key.output_channels) << 8) ^ std::size_t(key.relu) ^
+             std::size_t(key.context);
+    }
+  };
+  static std::mutex admission_mutex;
+  static std::unordered_map<AdmissionKey, bool, AdmissionKeyHash> admitted;
+  const AdmissionKey shape{image.width, image.height, w, h, stem.output_channels,
+                           stem.kernel, stem.stride, stem.pad, stem.relu ? 1 : 0,
+                           detail::VulkanHybridAdmissionContext()};
+  bool select_gpu{};
+  {
+    std::lock_guard lock(admission_mutex);
+    const auto found = admitted.find(shape);
+    if (found != admitted.end()) {
+      select_gpu = found->second;
+    } else {
+      Image probe;
+      probe.width = image.width;
+      probe.height = image.height;
+      probe.rgb.resize(image.rgb.size());
+      for (std::size_t i = 0; i < probe.rgb.size(); ++i)
+        probe.rgb[i] = static_cast<std::uint8_t>((i * 37u) % 251u);
+      Tensor cpu_nchw = DetInput(probe, opt);
+      Tensor cpu{{1, stem.output_channels, out_h, out_w},
+                 std::vector<float>(std::size_t(stem.output_channels) * out_h * out_w)};
+      Tensor gpu = cpu;
+      constexpr int kRuns = 3;
+      if (!detail::VulkanResizeRgbAndConv2d(
+              gpu.data.data(), probe.rgb.data(), probe.rgb.size(), probe.width, probe.height,
+              w, h, stem.weights, stem.bias, stem.output_channels, stem.kernel, stem.stride,
+              stem.pad, stem.relu)) {
+        admitted.emplace(shape, false);
+        return false;
+      }
+      double cpu_total{};
+      double gpu_total{};
+      bool ok = true;
+      for (int run = 0; run < kRuns && ok; ++run) {
+        const auto cpu_begin = std::chrono::steady_clock::now();
+        cpu_nchw = DetInput(probe, opt);
+        detail::kernels::Conv2d(cpu.data.data(), cpu_nchw.data.data(), stem.weights, stem.bias,
+                                3, stem.output_channels, h, w, out_h, out_w, stem.kernel,
+                                stem.kernel, stem.stride, stem.stride, stem.pad, stem.pad,
+                                stem.relu);
+        cpu_total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - cpu_begin).count();
+        const auto gpu_begin = std::chrono::steady_clock::now();
+        ok = detail::VulkanResizeRgbAndConv2d(
+            gpu.data.data(), probe.rgb.data(), probe.rgb.size(), probe.width, probe.height, w, h,
+            stem.weights, stem.bias, stem.output_channels, stem.kernel, stem.stride, stem.pad,
+            stem.relu);
+        gpu_total += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - gpu_begin).count();
+        if (!ok || cpu.data.size() != gpu.data.size()) {
+          ok = false;
+          break;
+        }
+        float max_abs = 0.F;
+        for (std::size_t i = 0; i < gpu.data.size(); ++i) {
+          const float err = std::abs(gpu.data[i] - cpu.data[i]);
+          if (err > max_abs) max_abs = err;
+        }
+        // One uint8 bilinear step after ImageNet affine is ~0.017 in NCHW;
+        // a 3x3 s2 stem can stretch that to a few 1e-2 on the Conv.0 map.
+        if (max_abs > 8e-2F) ok = false;
+        if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr) {
+          std::cerr << "hybrid RGB+Conv.0 max_abs=" << max_abs << " ok=" << ok << '\n';
+        }
+      }
+      // This boundary includes upload, resize, convolution and readback, so
+      // 30% grace frees CPU for REC while still bounded.
+      select_gpu = ok && (gpu_total <= cpu_total * 1.30);
+      admitted.emplace(shape, select_gpu);
+      if (std::getenv("PPOCR_HYBRID_TRACE") != nullptr) {
+        std::cerr << "hybrid RGB+Conv.0 admission ok=" << ok
+                  << " gpu_ms=" << (gpu_total / kRuns) << " cpu_ms=" << (cpu_total / kRuns)
+                  << " select=" << select_gpu << " name=" << stem.output_name << '\n';
+      }
+    }
+  }
+  if (!select_gpu) return false;
+  stem_output.shape = {1, stem.output_channels, out_h, out_w};
+  stem_output.data.resize(std::size_t(stem.output_channels) * out_h * out_w);
+  if (!detail::VulkanResizeRgbAndConv2d(
+          stem_output.data.data(), image.rgb.data(), image.rgb.size(), image.width, image.height,
+          w, h, stem.weights, stem.bias, stem.output_channels, stem.kernel, stem.stride,
+          stem.pad, stem.relu)) {
+    return false;
+  }
+  stem_output_name = stem.output_name;
+  return true;
+}
+
+// rapidocr main DetPreProcess: cv2.resize (INTER_LINEAR) to the 32-snapped
+// size, then (float32(v) * float32(1/255) - mean) / std in float32 (main #756
+// keeps mean/std in float32). Both steps are bit-exact (cv_compat + a
+// per-value table).
+void WriteDetInput(float* output, const Image& image, int w, int h, const Options& opt) {
+  thread_local std::vector<std::uint8_t> resized;
+  resized.resize(std::size_t(w) * h * 3);
+  detail::cvc::ResizeLinear8u(image.rgb.data(), image.width, image.height,
+                              std::size_t(image.width) * 3, 3, resized.data(), w, h,
+                              std::size_t(w) * 3);
+  std::array<std::array<float, 256>, 3> lut{};
+  for (std::size_t c = 0; c < 3; ++c)
+    lut[c] = detail::cvc::DetNormalizeTable(opt.det_mean[c], opt.det_std[c]);
+  const std::size_t plane = std::size_t(w) * h;
+  float* const blue = output;
+  float* const green = blue + plane;
+  float* const red = green + plane;
+  const std::uint8_t* rgb = resized.data();
+  for (std::size_t i = 0; i < plane; ++i, rgb += 3) {
+    blue[i] = lut[0][rgb[2]];
+    green[i] = lut[1][rgb[1]];
+    red[i] = lut[2][rgb[0]];
+  }
+}
+
+Tensor DetInput(const Image& image, const Options& opt) {
+  const auto [w, h] = DetInputSize(image, opt);
+  Tensor output{{1, 3, h, w}, std::vector<float>(std::size_t(3) * h * w)};
+  WriteDetInput(output.data.data(), image, w, h, opt);
+  return output;
+}
+
+int RecInputWidth(const CropBounds& crop, const Options& opt) {
+  return std::clamp(int(std::ceil(float(opt.rec_height) * crop.width / crop.height)),
+                    1, opt.rec_max_width);
+}
+
+bool GpuRecPadToPageMax() noexcept {
+  // GPU rec graphs of different widths serialize on one queue. Packing a
+  // page to the max width records one N=K graph, but current transformer
+  // exports are sensitive to the resulting padded attention length. Keep it
+  // opt-in after model/driver qualification. `PPOCR_DISABLE_GPU_REC_PAD_MAX`
+  // restores exact-width graphs.
+  static const bool enabled =
+      std::getenv("PPOCR_ENABLE_GPU_REC_PAD_MAX") != nullptr &&
+      std::getenv("PPOCR_DISABLE_GPU_REC_PAD_MAX") == nullptr;
+  return enabled;
+}
+
+// rapidocr 3.x DBPostProcess (ch_ppocr_det/utils.py), reproduced without
+// OpenCV: threshold + optional 2x2 dilation, 8-connected components (the
+// outer contours of cv2.findContours), then Rapidocr3DbBox (db_geometry.cpp)
+// for the bit-exact cv2.minAreaRect / box_score_fast / pyclipper unclip /
+// second minAreaRect / float32 rounding, and TextDetector.sorted_boxes.
+void SortBoxesLikeRapidocr(std::vector<Box>& boxes) {
+  // rapidocr 3.10 TextDetector.sorted_boxes: stable sort by the first point's
+  // y; a new line starts wherever the gap to the previous sorted y is >= 10
+  // (float32); then np.lexsort((x, line_id)), i.e. a stable sort by
+  // (line_id, x) over the y-sorted order.
+  std::stable_sort(boxes.begin(), boxes.end(),
+                   [](const Box& a, const Box& b) { return a.p[0].y < b.p[0].y; });
+  const std::size_t n = boxes.size();
+  std::vector<std::size_t> line(n, 0);
+  for (std::size_t i = 1; i < n; ++i)
+    line[i] = line[i - 1] + ((boxes[i].p[0].y - boxes[i - 1].p[0].y) >= 10.F ? 1 : 0);
+  std::vector<std::size_t> order(n);
+  for (std::size_t i = 0; i < n; ++i) order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    if (line[a] != line[b]) return line[a] < line[b];
+    return boxes[a].p[0].x < boxes[b].p[0].x;
+  });
+  std::vector<Box> sorted;
+  sorted.reserve(n);
+  for (std::size_t i : order) sorted.push_back(boxes[i]);
+  boxes.swap(sorted);
+}
+
+std::vector<Box> DBPost(const Tensor& prob, int dst_w, int dst_h, const Options& opt,
+                        std::size_t batch_index = 0) {
+  if (prob.shape.size()!=4 || prob.shape[0] <= 0 || prob.shape[1]!=1 ||
+      batch_index >= static_cast<std::size_t>(prob.shape[0])) Fail("unexpected detector output shape");
+  const int h=int(prob.shape[2]),w=int(prob.shape[3]);
+  if (h <= 0 || w <= 0 || dst_w <= 0 || dst_h <= 0) return {};
+  const auto probability = prob.data.data() + batch_index * std::size_t(h) * w;
+  std::vector<std::uint8_t> mask(std::size_t(w)*h);
+  detail::kernels::BuildDetectorMask(mask.data(), probability, h, w, opt.det_threshold,
+                                     opt.det_use_dilation != 0);
+  const std::array<int,8> dx{-1,0,1,-1,1,-1,0,1},dy{-1,-1,-1,0,0,1,1,1};
+  std::vector<Box> out; out.reserve(64);
+  std::vector<int> queue; queue.reserve(256);
+  std::vector<int> row_min, row_max;
+  std::vector<std::array<long long, 2>> pts, hull;
+  std::vector<int> contour;
+  const double box_thresh = detail::ShortestDouble(opt.det_box_threshold);
+  const double unclip_ratio = detail::ShortestDouble(opt.det_unclip_ratio);
+  int examined = 0;
+  const int candidate_limit = opt.det_max_candidates > 0 ? opt.det_max_candidates : 1000000000;
+  for(int sy=0;sy<h && examined<candidate_limit;++sy)for(int sx=0;sx<w && examined<candidate_limit;++sx){
+    const auto start=std::size_t(sy)*w+sx;
+    if(mask[start]!=1) continue;
+    ++examined;
+    queue.clear();
+    queue.push_back(int(start));
+    mask[start]=2;
+    std::size_t head{};
+    int miny=sy,maxy=sy;
+    while(head<queue.size()){
+      const int v=queue[head++], y=v/w, x=v%w;
+      miny=std::min(miny,y); maxy=std::max(maxy,y);
+      for(int k=0;k<8;++k){
+        const int nx=x+dx[k], ny=y+dy[k];
+        if(nx>=0&&nx<w&&ny>=0&&ny<h){
+          const auto ni=std::size_t(ny)*w+nx;
+          if(mask[ni]==1){mask[ni]=2; queue.push_back(int(ni));}
+        }
+      }
+    }
+    // Row extents give every point that can lie on the convex hull.
+    const int rows = maxy - miny + 1;
+    row_min.assign(std::size_t(rows), w);
+    row_max.assign(std::size_t(rows), -1);
+    for (const int v : queue) {
+      const int y = v / w - miny, x = v % w;
+      row_min[std::size_t(y)] = std::min(row_min[std::size_t(y)], x);
+      row_max[std::size_t(y)] = std::max(row_max[std::size_t(y)], x);
+    }
+    pts.clear();
+    for (int r = 0; r < rows; ++r) {
+      pts.push_back({row_min[std::size_t(r)], r + miny});
+      if (row_max[std::size_t(r)] != row_min[std::size_t(r)]) pts.push_back({row_max[std::size_t(r)], r + miny});
+    }
+    std::sort(pts.begin(), pts.end());
+    hull.assign(pts.size() * 2, {0, 0});
+    std::size_t k = 0;
+    const auto cross = [](const std::array<long long, 2>& o, const std::array<long long, 2>& a,
+                          const std::array<long long, 2>& b) {
+      return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+    };
+    for (std::size_t i = 0; i < pts.size(); ++i) {
+      while (k >= 2 && cross(hull[k - 2], hull[k - 1], pts[i]) <= 0) --k;
+      hull[k++] = pts[i];
+    }
+    for (std::size_t i = pts.size() - 1, t = k + 1; i-- > 0;) {
+      while (k >= t && cross(hull[k - 2], hull[k - 1], pts[i]) <= 0) --k;
+      hull[k++] = pts[i];
+    }
+    hull.resize(k > 1 ? k - 1 : k);
+    // cv2.findContours starts the outer border at the raster-first pixel
+    // and walks it opposite to the monotone chain above. minAreaRect's hull
+    // (and its float32 tie-breaks) depends on that index order.
+    std::size_t first = 0;
+    for (std::size_t i = 0; i < hull.size(); ++i) {
+      if (hull[i][0] == sx && hull[i][1] == sy) { first = i; break; }
+    }
+    const std::size_t m = hull.size();
+    contour.resize(m * 2);
+    for (std::size_t i = 0; i < m; ++i) {
+      const auto& p = hull[(first + m - i) % m];
+      contour[2 * i] = int(p[0]);
+      contour[2 * i + 1] = int(p[1]);
+    }
+    float xy[8];
+    float score = 0.F;
+    if (!detail::Rapidocr3DbBox(contour.data(), int(m), probability, h, w, dst_w, dst_h,
+                                box_thresh, unclip_ratio, xy,
+                                &score)) {
+      continue;
+    }
+    Box b;
+    for (int i = 0; i < 4; ++i) b.p[std::size_t(i)] = Point{xy[2 * i], xy[2 * i + 1]};
+    b.score = score;
+    out.push_back(b);
+  }
+  SortBoxesLikeRapidocr(out);
+  return out;
+}
+
+
+std::vector<Box> DBPostDevice(detail::VulkanTensorArena& arena,
+                              const detail::OnnxLite::GpuTensor& probability,
+                              std::size_t batch_index, int dst_w, int dst_h,
+                              const Options& opt) {
+  if (probability.shape.size() != 4 || probability.shape[0] <= 0 ||
+      probability.shape[1] != 1 || probability.shape[2] <= 0 ||
+      probability.shape[3] <= 0 ||
+      batch_index >= static_cast<std::size_t>(probability.shape[0])) {
+    Fail("unexpected GPU-only detector output shape");
+  }
+  const int height = static_cast<int>(probability.shape[2]);
+  const int width = static_cast<int>(probability.shape[3]);
+  const std::size_t plane = std::size_t(height) * width;
+  // The probability map is read back and DBPost runs on the CPU for every
+  // GPU backend. DBPost reproduces rapidocr 3.x (rotated minimum-area boxes,
+  // polygon score); the device kernel only emits axis-aligned component
+  // boxes, so using it would make Vulkan disagree with CPU and Metal. On
+  // Metal the readback is a memcpy from unified memory. The legacy device
+  // kernel stays available behind PPOCR_DEVICE_DB_POSTPROCESS=1 (or the old
+  // PPOCR_METAL_DEVICE_DB_POSTPROCESS=1) and does not match 3.x boxes.
+  static const bool device_db = std::getenv("PPOCR_DEVICE_DB_POSTPROCESS") != nullptr ||
+                                std::getenv("PPOCR_METAL_DEVICE_DB_POSTPROCESS") != nullptr;
+  if (!device_db) {
+    const std::size_t elements = (batch_index + 1) * plane;
+    std::vector<float> host(elements);
+    if (!arena.Download(host.data(), probability.slot, elements)) FailGpuOnly("DB postprocess download");
+    Tensor map({1, 1, height, width},
+               std::vector<float>(host.begin() + std::ptrdiff_t(batch_index * plane), host.end()));
+    return DBPost(map, dst_w, dst_h, opt);
+  }
+  std::vector<detail::VulkanDbBox> compact;
+  if (!arena.DbPostprocess(probability.slot, batch_index * plane, height, width,
+                           dst_w, dst_h, opt.det_threshold, opt.det_box_threshold,
+                           opt.det_unclip_ratio, compact, opt.det_use_dilation != 0)) {
+    FailGpuOnly("DB postprocess");
+  }
+  std::vector<Box> boxes;
+  boxes.reserve(compact.size());
+  for (const auto& item : compact) {
+    Box box;
+    box.p = {Point{item.x0, item.y0}, Point{item.x1, item.y0},
+             Point{item.x1, item.y1}, Point{item.x0, item.y1}};
+    box.score = item.score;
+    boxes.push_back(box);
+  }
+  return boxes;
+}
+
+CropBounds CropBoundsFor(const Image& src, const Box& box) {
+  // The detector normally emits horizontal text lines.  Bilinear crop here
+  // is deliberately kept local; applications needing rotated-page parity can
+  // replace this adapter while keeping model inference unchanged.
+  float minx=box.p[0].x,maxx=box.p[0].x,miny=box.p[0].y,maxy=box.p[0].y;for(const auto&p:box.p){minx=std::min(minx,p.x);maxx=std::max(maxx,p.x);miny=std::min(miny,p.y);maxy=std::max(maxy,p.y);}
+  int x0=std::clamp(int(std::floor(minx)),0,src.width-1),x1=std::clamp(int(std::ceil(maxx)),x0+1,src.width),y0=std::clamp(int(std::floor(miny)),0,src.height-1),y1=std::clamp(int(std::ceil(maxy)),y0+1,src.height);return {x0, y0, x1-x0, y1-y0};
+}
+
+std::vector<std::string> ReadDict(const std::string& path) {
+  std::ifstream f(path);if(!f)Fail("cannot open dictionary "+path);std::vector<std::string> out{""};std::string line;while(std::getline(f,line)){if(!line.empty()&&line.back()=='\r')line.pop_back();out.push_back(line);}out.push_back(" ");return out;
+}
+
+std::pair<std::string,float> DecodeCTC(const detail::OnnxLite::CtcTop1Output& t,
+                                       std::size_t batch_index,
+                                       const std::vector<std::string>& dict) {
+  if (batch_index>=std::size_t(t.batches)) Fail("unexpected recognizer output");
+  std::string text; float sum{}; int n{},prev=-1;
+  const bool ragged = !t.sequence_steps.empty();
+  if (ragged && (t.sequence_steps.size() != std::size_t(t.batches) ||
+                 t.row_offsets.size() != std::size_t(t.batches))) {
+    Fail("invalid ragged recognizer output");
+  }
+  const auto offset = ragged ? t.row_offsets[batch_index] : batch_index*std::size_t(t.steps);
+  const auto count = ragged ? t.sequence_steps[batch_index] : t.steps;
+  for(int s=0;s<count;++s) { const int best=t.indices[offset+s]; if(best<0||best>=int(dict.size()))Fail("dictionary vocab does not match recognition model"); const float p=t.probabilities[offset+s]; if(best&&best!=prev){text+=dict[best];sum+=p;++n;} prev=best; }
+  return {text,n?sum/n:0.F};
+}
+
+// Same decode, also recording each kept character's time step and
+// probability (rapidocr main CTCLabelDecode.decode `selection`).
+int DecodeCTCChars(const detail::OnnxLite::CtcTop1Output& t, std::size_t batch_index,
+                   std::vector<int>& cols, std::vector<float>& probs) {
+  cols.clear();
+  probs.clear();
+  const bool ragged = !t.sequence_steps.empty();
+  const auto offset = ragged ? t.row_offsets[batch_index] : batch_index*std::size_t(t.steps);
+  const int count = ragged ? t.sequence_steps[batch_index] : t.steps;
+  int prev = -1;
+  for (int s = 0; s < count; ++s) {
+    const int best = t.indices[offset + s];
+    if (best && best != prev) {
+      cols.push_back(s);
+      probs.push_back(t.probabilities[offset + s]);
+    }
+    prev = best;
+  }
+  return count;
+}
+
+// Per-character data of a GPU-only line (the CPU path fills the same fields
+// in RecognizeCrops). The GPU graph samples the axis-aligned rectangle
+// `crop`, padded to `tensor_width`; the line's share of the CTC steps is
+// rec_steps * (crop.w / crop.h) / (tensor_width / rec_height). The crop
+// size reported is the rotated crop the CPU path would cut (main's
+// get_rotate_crop_image) with rec_max_wh_ratio scaled so main's
+// line_txt_len = rec_steps * crop_width / crop_height / rec_max_wh_ratio
+// keeps that share: word boxes map back through the line box like on CPU.
+void FillGpuChars(Result& r, const detail::OnnxLite::CtcTop1Output& t, std::size_t item,
+                  const Box& box, const CropBounds& crop, int tensor_width, int rec_height) {
+  r.rec_steps = DecodeCTCChars(t, item, r.char_cols, r.char_probs);
+  const auto norm = [&](int a, int b) {
+    const float dx = box.p[a].x - box.p[b].x, dy = box.p[a].y - box.p[b].y;
+    return std::sqrt(dx * dx + dy * dy);
+  };
+  int w = static_cast<int>(std::max(norm(0, 1), norm(2, 3)));
+  int h = static_cast<int>(std::max(norm(0, 3), norm(1, 2)));
+  if (w <= 0 || h <= 0) w = crop.width, h = crop.height;
+  if (h * 1.0 / w >= 1.5) std::swap(w, h);
+  r.crop_width = w;
+  r.crop_height = h;
+  const double tensor_ratio = std::max(tensor_width / static_cast<double>(rec_height),
+                                       crop.width / static_cast<double>(crop.height));
+  r.rec_max_wh_ratio = tensor_ratio * (w / static_cast<double>(h)) /
+                       (crop.width / static_cast<double>(crop.height));
+}
+
+Result MakeResult(const Box& b, std::string text, float confidence) {
+  Result x;x.text=std::move(text);x.confidence=confidence;
+  float minx=b.p[0].x,maxx=minx,miny=b.p[0].y,maxy=miny;
+  for(int i=0;i<4;++i){x.box[i]={int(std::lround(b.p[i].x)),int(std::lround(b.p[i].y))};minx=std::min(minx,b.p[i].x);maxx=std::max(maxx,b.p[i].x);miny=std::min(miny,b.p[i].y);maxy=std::max(maxy,b.p[i].y);}
+  x.bbox={int(std::lround(minx)),int(std::lround(miny)),int(std::lround(maxx-minx)),int(std::lround(maxy-miny))};
+  return x;
+}
+
+}  // namespace
+
+struct OCR::Impl {
+  detail::OnnxLite det, rec;
+  Options opt;
+  std::vector<std::string> dict;
+  bool keep_gpu_constants{};
+  // Backend::metal was requested and the Metal GPU-only graph is in use.
+  bool metal{};
+  // Why a requested Metal backend is not in use (empty when it is).
+  std::string backend_note;
+  // GPU services may encounter a one-off 4K/8K page. Retain small-model
+  // immutable weights but reclaim completed transient arena buffers after
+  // every public request by default, so a later tiny request does not inherit
+  // that page's GPU/host-visible allocation. PPOCR_GPU_RECLAIM_TRANSIENT=0
+  // (or its legacy GPU-only spelling) keeps reusable capacity after a
+  // deployment-specific throughput/memory measurement.
+  bool reclaim_gpu_transient{true};
+  // Some conservative Vulkan drivers reject a particular N-batch graph
+  // although each N=1 graph is valid.  Remember that exact qualified shape
+  // after the first strict failure: repeatedly triggering a device-loss
+  // recovery is slower than immediately scheduling the same work as isolated
+  // GPU-only graphs.  This cache never enables a CPU fallback.
+  mutable std::mutex gpu_batch_rejection_mutex;
+  mutable std::unordered_set<std::string> gpu_batch_rejections;
+  // Hybrid may run the recorded GPU graph when it is complete. Cache the
+  // first-call outcome so a rejected graph does not pay a throw every page.
+  // PPOCR_DISABLE_HYBRID_GPU_GRAPH keeps the previous per-operator hybrid.
+  mutable std::mutex hybrid_gpu_graph_mutex;
+  // One handle may be called from several threads. The ONNX interpreter and
+  // the process-wide Vulkan queue are not safe to enter concurrently, so
+  // public inference calls take this lock. RecognizeBatch calls Recognize on
+  // the same thread, so the mutex is recursive.
+  mutable std::recursive_mutex recognize_mutex;
+  mutable int hybrid_gpu_graph_state{};
+  // A complete graph can be required by an application, but hybrid's normal
+  // policy is finer grained: every Vulkan segment is admitted only when its
+  // measured H2D/dispatch/D2H boundary is no slower than CPU. Keep the whole
+  // graph opt-in so one slow UMA graph cannot override those per-segment
+  // decisions merely because it happens to run successfully.
+  bool enable_hybrid_gpu_graph{};
+  // CPU recognizer for one page: rapidocr 3.10 crops, batching and resize.
+  // use_cls runs the text-line orientation classifier on the crops first
+  // (rapidocr main TextClassifier) and rotates "180" lines before recognition.
+  std::vector<Result> RecognizeCrops(const Image& image, const std::vector<Box>& boxes,
+                                     bool use_det, bool profile_e2e, bool use_cls = false,
+                                     bool rec_on_gpu = false);
+  // Orientation classifier (CPU graph). Empty unless a cls model was given.
+  detail::OnnxLite cls;
+  bool cls_loaded{};
+  // Handle default for use_cls (Options::use_cls after PPOCR_USE_CLS).
+  bool cls_default{};
+  OCR::RecOrderFn rec_order;
+  void LoadClassifier(const Options& o);
+  // Indra lite pipeline (det_model is a lite folder); det / rec stay empty.
+  std::shared_ptr<indra::LiteEngine> lite;
+  Impl(std::shared_ptr<indra::LiteEngine> l, Options o) : opt(o), lite(std::move(l)) {}
+  Impl(const std::string& d, const std::string& r, Options o)
+      : det(d, o.backend), rec(r, o.backend), opt(o) {
+    // Re-uploading both models' weights between every detector/recognizer
+    // stage wastes most of a tiny/small Vulkan call. Medium needs the former
+    // conservative UMA hand-off, so retain a complete pair only below a
+    // bounded payload (overridable before construction).
+    std::size_t limit = 64u * 1024u * 1024u;
+    if (const char* text = std::getenv("PPOCR_GPU_CONSTANT_CACHE_MB")) {
+      char* end{};
+      const auto mib = std::strtoull(text, &end, 10);
+      if (end != text && *end == '\0' &&
+          mib <= std::numeric_limits<std::size_t>::max() / (1024u * 1024u)) {
+        limit = static_cast<std::size_t>(mib) * 1024u * 1024u;
+      }
+    }
+    const auto det_bytes = det.GpuImmutableBytes();
+    const auto rec_bytes = rec.GpuImmutableBytes();
+    keep_gpu_constants = (o.backend == Backend::gpu_only || o.backend == Backend::hybrid) &&
+        det_bytes <= limit && rec_bytes <= limit - det_bytes;
+    if (const char* common_reclaim = std::getenv("PPOCR_GPU_RECLAIM_TRANSIENT")) {
+      reclaim_gpu_transient = std::string_view{common_reclaim} != "0";
+    } else if (const char* legacy_reclaim = std::getenv("PPOCR_GPU_ONLY_RECLAIM_TRANSIENT")) {
+      reclaim_gpu_transient = std::string_view{legacy_reclaim} != "0";
+    }
+    enable_hybrid_gpu_graph = o.backend == Backend::hybrid &&
+        std::getenv("PPOCR_ENABLE_HYBRID_GPU_GRAPH") != nullptr;
+  }
+};
+
+int GpuRecognitionWidth(const CropBounds& crop, const Options& opt) {
+  // PP-OCR recognizer convolution/CTC is sensitive to the right boundary.
+  // Use the actual aspect-ratio width: padding a tensor to a scheduling grid
+  // creates extra valid time rows and can change both text and confidence.
+  return RecInputWidth(crop, opt);
+}
+
+struct GpuCropJob {
+  std::size_t page{};
+  std::size_t result{};
+  const Image* image{};
+  const Box* box{};
+  CropBounds crop{};
+};
+
+bool GpuKeepPageRgb() {
+  static const bool keep = std::getenv("PPOCR_DISABLE_GPU_KEEP_PAGE_RGB") == nullptr;
+  return keep;
+}
+
+detail::OnnxLite::GpuTensor GpuOnlyRecRgb(detail::OnnxLite& rec, const Options& opt,
+                                          const std::vector<GpuCropJob>& jobs, int width,
+                                          const detail::VulkanTensorSlot* page_rgb) {
+  const auto rec_norm = ChannelNormFrom(opt.rec_mean, opt.rec_std);
+  const std::size_t count = jobs.size();
+  const std::size_t plane = std::size_t(3) * opt.rec_height * width;
+  auto& arena = rec.gpu_arena();
+  // After the first rec graph records, RGB resize writes the pinned replay
+  // NCHW directly. That skips a device Copy (a full submit+fence on UMA).
+  const auto peeked = rec.PeekGpuReplayInput(
+      {static_cast<std::int64_t>(count), 3, opt.rec_height, width}, true);
+  const bool borrowed = peeked.resident && peeked.live_elements >= count * plane;
+  auto input = borrowed ? peeked : arena.Acquire(count * plane, "ocr-rec-input-batch");
+  if (!input.resident) Fail("GPU-only recognizer batch allocation failed");
+  if (borrowed) arena.DeferNextStandaloneSubmit();
+  // OCR pages commonly yield several same-width lines.  Upload their packed
+  // RGB source once, generate every corresponding NCHW plane, then release
+  // it before moving to the next source.  The previous per-crop loop
+  // re-uploaded the complete page for every line, which was especially
+  // costly for dense documents.  Source slots retain their narrow lifetime:
+  // at most one source image is live beside the batched recognizer input.
+  struct SourceJobs { const Image* image{}; std::vector<std::size_t> items; };
+  std::vector<SourceJobs> source_jobs;
+  source_jobs.reserve(count);
+  std::unordered_map<const Image*, std::size_t> source_index;
+  source_index.reserve(count);
+  for (std::size_t item = 0; item < count; ++item) {
+    const auto [it, inserted] = source_index.emplace(jobs[item].image, source_jobs.size());
+    if (inserted) source_jobs.push_back({jobs[item].image, {}});
+    source_jobs[it->second].items.push_back(item);
+  }
+  for (const auto& source : source_jobs) {
+    const bool reuse_page = page_rgb && page_rgb->resident && source_jobs.size() == 1 &&
+        page_rgb->live_elements >= source.image->rgb.size();
+    auto rgb = reuse_page ? *page_rgb
+                          : arena.Acquire(source.image->rgb.size(), "ocr-rec-rgb");
+    const bool uploaded = reuse_page ||
+        (rgb.resident && arena.UploadRgb8(
+            rgb, source.image->rgb.data(), source.image->rgb.size()));
+    bool resized = uploaded;
+    // Metal: record a source's crop resizes into one command buffer (one
+    // fence instead of one per crop). The first crop stays standalone so
+    // its normalization constants are written before any recording starts.
+    static const bool group_resizes = detail::MetalDriverRequested() &&
+        std::getenv("PPOCR_METAL_DISABLE_GROUPED_REC_RESIZE") == nullptr;
+    bool recording = false;
+    for (const std::size_t item : source.items) {
+      if (group_resizes && resized && !recording && item != source.items.front() &&
+          source.items.size() > 2) {
+        recording = arena.BeginGraphRecording();
+      }
+      const auto& job = jobs[item];
+      // `width` is the 64-aligned Vulkan tensor grid.  Sampling must however
+      // use the unrounded PP-OCR aspect-ratio width; the trailing grid columns
+      // are explicitly zero.  Resizing a 5px crop to 64 instead of its
+      // natural 40px width changes the recognizer's receptive field and was
+      // the source of short-crop GPU-only CTC mismatches.
+      const int content_width = RecInputWidth(job.crop, opt);
+      if (const auto trace_index = TraceOcrCropResult(); trace_index &&
+          job.page == 0 && job.result == *trace_index) {
+        std::cerr << "GPU-only trace crop result=" << job.result
+                  << " bounds=" << job.crop.x << ',' << job.crop.y << ','
+                  << job.crop.width << 'x' << job.crop.height
+                  << " natural_width=" << content_width
+                  << " graph_width=" << width << " batch_item=" << item << '\n';
+      }
+      resized = resized && arena.ResizeRgbToNchwAt(
+          rgb, input, item * plane, source.image->width, source.image->height,
+          job.crop.x, job.crop.y, job.crop.width, job.crop.height, width,
+          opt.rec_height, rec_norm.scale[0], rec_norm.offset[0], rec_norm.scale[1],
+          rec_norm.offset[1], rec_norm.scale[2], rec_norm.offset[2], content_width);
+      if (!resized) break;
+    }
+    if (recording) resized = arena.EndGraphRecording(resized) && resized;
+    if (!reuse_page) arena.Release(rgb);
+    if (!resized) {
+      (void)arena.FlushDeferredStandalone();
+      if (!borrowed) arena.Release(input);
+      FailGpuOnly("recognizer batch front end");
+    }
+  }
+  return {{static_cast<std::int64_t>(count), 3, opt.rec_height, width}, input};
+}
+
+void RecognizeGpuOnlyCropBatch(detail::OnnxLite& rec, const Options& opt,
+                                const std::vector<std::string>& dict,
+                                const std::vector<GpuCropJob>& jobs,
+                                std::vector<std::vector<Result>>& output,
+                                const detail::VulkanTensorSlot* page_rgb) {
+  if (jobs.empty()) return;
+  int width = 0;
+  for (const auto& job : jobs) {
+    if (!job.image || !job.box) Fail("GPU-only recognizer batch shape mismatch");
+    width = std::max(width, GpuRecognitionWidth(job.crop, opt));
+  }
+  if (width <= 0) Fail("GPU-only recognizer batch shape mismatch");
+  auto rec_input = GpuOnlyRecRgb(rec, opt, jobs, width, page_rgb);
+  const std::size_t count = jobs.size();
+  detail::OnnxLite::CtcTop1Output ctc;
+  if (!rec.RunGpuOnlyCtcTop1({{"x", std::move(rec_input)}}, ctc) ||
+      ctc.batches != static_cast<int>(count)) {
+    FailGpuOnly("recognizer batch/CTC graph");
+  }
+  for (std::size_t item = 0; item < count; ++item) {
+    const auto& job = jobs[item];
+    auto [text, confidence] = DecodeCTC(ctc, item, dict);
+    if (const auto trace_index = TraceOcrCropResult(); trace_index &&
+        job.page == 0 && job.result == *trace_index) {
+      const auto offset = item * static_cast<std::size_t>(ctc.steps);
+      std::cerr << "GPU-only trace CTC result=" << job.result << " rows=";
+      for (int step = 0; step < ctc.steps; ++step) {
+        if (step) std::cerr << ',';
+        std::cerr << ctc.indices[offset + static_cast<std::size_t>(step)] << '@'
+                  << ctc.probabilities[offset + static_cast<std::size_t>(step)];
+      }
+      std::cerr << '\n';
+    }
+    output[job.page][job.result] = MakeResult(*job.box, std::move(text), confidence);
+    FillGpuChars(output[job.page][job.result], ctc, item, *job.box, job.crop, width, opt.rec_height);
+  }
+}
+
+// Width-batched GPU recognition: crops of nearby widths share one graph at
+// the widest width; each item is masked to its own natural width (see
+// OnnxLite::RunGpuOnlyCtcTop1Masked), so text matches the exact-width
+// graphs. On by default under Metal, where one recognizer graph per line is
+// bound by dispatch latency; PPOCR_ENABLE_GPU_REC_WIDTH_BATCH=1 enables it on
+// Vulkan and PPOCR_DISABLE_GPU_REC_WIDTH_BATCH=1 turns it off.
+// PPOCR_GPU_REC_WIDTH_BATCH_MAX (default 8) caps the crops per graph and
+// PPOCR_GPU_REC_WIDTH_BATCH_RATIO (default 1.5) the widest/narrowest ratio.
+bool GpuRecWidthBatchEnabled() {
+  static const bool enabled = std::getenv("PPOCR_DISABLE_GPU_REC_WIDTH_BATCH") == nullptr &&
+      (detail::MetalDriverRequested() || std::getenv("PPOCR_ENABLE_GPU_REC_WIDTH_BATCH") != nullptr);
+  return enabled;
+}
+
+std::atomic<bool> g_gpu_rec_width_batch_failed{false};
+
+bool RecognizeGpuOnlyMaskedBatch(detail::OnnxLite& rec, const Options& opt,
+                                 const std::vector<std::string>& dict,
+                                 const std::vector<GpuCropJob>& jobs,
+                                 std::vector<std::vector<Result>>& output,
+                                 const detail::VulkanTensorSlot* page_rgb) {
+  std::vector<int> widths;
+  widths.reserve(jobs.size());
+  for (const auto& job : jobs) widths.push_back(GpuRecognitionWidth(job.crop, opt));
+  const int width = *std::max_element(widths.begin(), widths.end());
+  if (width <= 0) return false;
+  auto rec_input = GpuOnlyRecRgb(rec, opt, jobs, width, page_rgb);
+  detail::OnnxLite::CtcTop1Output ctc;
+  if (!rec.RunGpuOnlyCtcTop1Masked({{"x", std::move(rec_input)}}, widths, ctc)) return false;
+  for (std::size_t item = 0; item < jobs.size(); ++item) {
+    const auto& job = jobs[item];
+    auto [text, confidence] = DecodeCTC(ctc, item, dict);
+    output[job.page][job.result] = MakeResult(*job.box, std::move(text), confidence);
+    FillGpuChars(output[job.page][job.result], ctc, item, *job.box, job.crop, widths[item], opt.rec_height);
+  }
+  return true;
+}
+
+std::vector<Result> RecognizeGpuOnlyCrops(detail::OnnxLite& rec, const Options& opt,
+                                          const std::vector<std::string>& dict,
+                                          const Image& image,
+                                          const std::vector<Box>& boxes,
+                                          const detail::VulkanTensorSlot* page_rgb) {
+  if (GpuRecWidthBatchEnabled() && !g_gpu_rec_width_batch_failed.load() && boxes.size() > 1) {
+    static const std::size_t max_items = [] {
+      const char* text = std::getenv("PPOCR_GPU_REC_WIDTH_BATCH_MAX");
+      const long value = text ? std::strtol(text, nullptr, 10) : 8;
+      return static_cast<std::size_t>(std::clamp(value, 1L, 256L));
+    }();
+    static const double max_ratio = [] {
+      const char* text = std::getenv("PPOCR_GPU_REC_WIDTH_BATCH_RATIO");
+      const double value = text ? std::strtod(text, nullptr) : 1.5;
+      return value >= 1.0 ? value : 1.5;
+    }();
+    std::vector<GpuCropJob> jobs;
+    jobs.reserve(boxes.size());
+    for (std::size_t index = 0; index < boxes.size(); ++index)
+      jobs.push_back({0, index, &image, &boxes[index], CropBoundsFor(image, boxes[index])});
+    std::stable_sort(jobs.begin(), jobs.end(), [&](const GpuCropJob& left, const GpuCropJob& right) {
+      return GpuRecognitionWidth(left.crop, opt) < GpuRecognitionWidth(right.crop, opt);
+    });
+    std::vector<std::vector<Result>> output(1);
+    output.front().resize(boxes.size());
+    for (std::size_t first = 0; first < jobs.size();) {
+      const int narrowest = GpuRecognitionWidth(jobs[first].crop, opt);
+      std::size_t last = first + 1;
+      while (last < jobs.size() && last - first < max_items &&
+             GpuRecognitionWidth(jobs[last].crop, opt) <= narrowest * max_ratio) ++last;
+      const std::vector<GpuCropJob> group(jobs.begin() + std::ptrdiff_t(first),
+                                          jobs.begin() + std::ptrdiff_t(last));
+      bool done = false;
+      if (group.size() > 1 && !g_gpu_rec_width_batch_failed.load()) {
+        done = RecognizeGpuOnlyMaskedBatch(rec, opt, dict, group, output, page_rgb);
+        if (!done) g_gpu_rec_width_batch_failed.store(true);
+      }
+      if (!done) {
+        // Exact-width graphs: one per distinct width of the group.
+        for (std::size_t begin = 0; begin < group.size();) {
+          std::size_t end = begin + 1;
+          const int width = GpuRecognitionWidth(group[begin].crop, opt);
+          while (end < group.size() && GpuRecognitionWidth(group[end].crop, opt) == width) ++end;
+          RecognizeGpuOnlyCropBatch(rec, opt, dict,
+                                    std::vector<GpuCropJob>(group.begin() + std::ptrdiff_t(begin),
+                                                            group.begin() + std::ptrdiff_t(end)),
+                                    output, page_rgb);
+          begin = end;
+        }
+      }
+      first = last;
+    }
+    return std::move(output.front());
+  }
+  // A single page can contain many text lines. Preserve each crop's exact
+  // PP-OCR width by default, but consolidate all equal-width crops before
+  // recording a recognizer graph. This remains GPU-only: RGB resize,
+  // recognizer and CTC all stay on the one Vulkan queue.
+  std::vector<std::vector<Result>> grouped_output(1);
+  grouped_output.front().resize(boxes.size());
+  std::map<int, std::vector<GpuCropJob>> buckets;
+  int page_pad_width = 0;
+  const bool pad_max = GpuRecPadToPageMax();
+  if (pad_max) {
+    for (const auto& box : boxes)
+      page_pad_width = std::max(page_pad_width,
+                                GpuRecognitionWidth(CropBoundsFor(image, box), opt));
+  }
+  for (std::size_t index = 0; index < boxes.size(); ++index) {
+    const auto crop = CropBoundsFor(image, boxes[index]);
+    const int job_width = GpuRecognitionWidth(crop, opt);
+    buckets[pad_max ? page_pad_width : job_width].push_back(
+        {0, index, &image, &boxes[index], crop});
+  }
+  const std::size_t cap = static_cast<std::size_t>(std::max(1, opt.rec_batch_size));
+  std::vector<std::vector<GpuCropJob>> batches;
+  batches.reserve(buckets.size());
+  for (auto& [_, jobs] : buckets) {
+    for (std::size_t first = 0; first < jobs.size(); first += cap) {
+      batches.emplace_back(jobs.begin() + first,
+                           jobs.begin() + std::min(jobs.size(), first + cap));
+    }
+  }
+  static const bool batch_replay =
+      std::getenv("PPOCR_DISABLE_GPU_BATCH_REPLAY") == nullptr;
+  // Two (or a few) already-recorded width graphs can share one fence. First
+  // page still records per width; later pages of the same shapes hit this.
+  // Dense pages bucket into many width groups (a 34-crop screenshot measured
+  // seven), so replay runs in bounded chunks instead of requiring the whole
+  // page to fit one submission; chunks whose graphs are not all resident fall
+  // through to the per-batch recorder below and hit replay on later pages.
+  constexpr std::size_t kReplayChunk = 8;
+  std::vector<bool> batch_done(batches.size(), false);
+  bool any_done = false;
+  if (batch_replay && batches.size() >= 2) {
+    for (std::size_t first = 0; first + 1 < batches.size(); first += kReplayChunk) {
+      const std::size_t span = std::min(kReplayChunk, batches.size() - first);
+      if (span < 2) break;
+      std::vector<detail::OnnxLite::GpuTensor> inputs(span);
+      std::vector<std::uint64_t> keys(span);
+      bool ready = true;
+      for (std::size_t i = 0; i < span && ready; ++i) {
+        int width = 0;
+        for (const auto& job : batches[first + i])
+          width = std::max(width, GpuRecognitionWidth(job.crop, opt));
+        if (width <= 0) { ready = false; break; }
+        const std::vector<std::int64_t> shape{
+            static_cast<std::int64_t>(batches[first + i].size()), 3,
+            opt.rec_height, width};
+        const auto peeked = rec.PeekGpuReplayInput(shape, true);
+        if (!peeked.resident) { ready = false; break; }
+        keys[i] = rec.GpuReplayKey(shape, true);
+        inputs[i] = GpuOnlyRecRgb(rec, opt, batches[first + i], width, page_rgb);
+      }
+      if (!ready) continue;
+      std::vector<detail::OnnxLite::CtcTop1Output> ctcs(span);
+      if (!rec.ReplayGpuCtcGraphs(keys.data(), static_cast<int>(span),
+                                  ctcs.data())) {
+        continue;
+      }
+      bool decoded = true;
+      for (std::size_t i = 0; i < span && decoded; ++i) {
+        if (ctcs[i].batches != static_cast<int>(batches[first + i].size())) {
+          decoded = false;
+          break;
+        }
+        for (std::size_t item = 0; item < batches[first + i].size(); ++item) {
+          const auto& job = batches[first + i][item];
+          auto [text, confidence] = DecodeCTC(ctcs[i], item, dict);
+          grouped_output[job.page][job.result] =
+              MakeResult(*job.box, std::move(text), confidence);
+          FillGpuChars(grouped_output[job.page][job.result], ctcs[i], item, *job.box, job.crop,
+                       static_cast<int>(inputs[i].shape.back()), opt.rec_height);
+        }
+      }
+      if (decoded) {
+        for (std::size_t i = 0; i < span; ++i) batch_done[first + i] = true;
+        any_done = true;
+      }
+    }
+    if (any_done && std::all_of(batch_done.begin(), batch_done.end(),
+                                [](bool done) { return done; })) {
+      return std::move(grouped_output.front());
+    }
+  }
+  for (std::size_t index = 0; index < batches.size(); ++index) {
+    if (batch_done[index]) continue;
+    RecognizeGpuOnlyCropBatch(rec, opt, dict, batches[index], grouped_output,
+                              page_rgb);
+  }
+  return std::move(grouped_output.front());
+}
+
+std::vector<Result> RecognizeGpuOnly(detail::OnnxLite& det, detail::OnnxLite& rec,
+                                      const Options& opt, const std::vector<std::string>& dict,
+                                      const Image& image, bool keep_gpu_constants) {
+  auto& det_arena = det.gpu_arena();
+  // The Vulkan runtime owns one physical arena for both models. On UMA GPUs,
+  // retaining detector and recognizer parameters together can exhaust the
+  // practical local-memory budget even though each graph fits independently.
+  // No recognizer activation is live at the start of the next page, so make
+  // its immutable slots reusable before staging the detector graph.
+  if (!keep_gpu_constants) rec.ReleaseGpuConstants();
+  const auto [det_w, det_h] = DetInputSize(image, opt);
+  const std::vector<std::int64_t> det_shape{1, 3, det_h, det_w};
+  // The explicit in-graph RGB mode remains a deployment A/B option. It pins
+  // the source slot beside the replay graph, which can be faster for a
+  // dedicated service with a small shape set but increases its steady-state
+  // device/host allocator footprint. The default keeps RGB source storage
+  // transient while detector/recognizer input replays remain enabled.
+  // The in-graph RGB front end normalizes with the ImageNet constants only.
+  static const bool rgb_in_graph_requested =
+      std::getenv("PPOCR_ENABLE_GPU_RGB_IN_GRAPH") != nullptr &&
+      std::getenv("PPOCR_DISABLE_GPU_RGB_IN_GRAPH") == nullptr;
+  const bool rgb_in_graph = rgb_in_graph_requested && IsDefaultDetectorNorm(opt);
+  // The detector front end applies Options::det_mean / det_std, like the CPU
+  // path (rapidocr's config uses 0.5 / 0.5, not the ImageNet defaults).
+  const auto det_norm = ChannelNormFrom(opt.det_mean, opt.det_std);
+  const auto peeked_rgb =
+      rgb_in_graph ? det.PeekGpuReplayRgb(det_shape, image.width, image.height)
+                   : detail::VulkanTensorSlot{};
+  auto det_rgb = peeked_rgb.resident ? peeked_rgb
+                                     : det_arena.Acquire(image.rgb.size(), "ocr-det-rgb");
+  const bool keep_page_rgb = GpuKeepPageRgb();
+  std::unordered_map<std::string, detail::OnnxLite::GpuTensor> det_outputs;
+  if (rgb_in_graph && det_rgb.resident &&
+      det_arena.UploadRgb8(det_rgb, image.rgb.data(), image.rgb.size())) {
+    detail::OnnxLite::GpuRgbFrontEnd front;
+    front.rgb = det_rgb;
+    front.source_width = image.width;
+    front.source_height = image.height;
+    front.left = 0;
+    front.top = 0;
+    front.region_width = image.width;
+    front.region_height = image.height;
+    front.output_width = det_w;
+    front.output_height = det_h;
+    if (!det.RunGpuOnlyDeviceFromRgb(front, det_outputs)) {
+      if (!peeked_rgb.resident) det_arena.Release(det_rgb);
+      FailGpuOnly("detector graph");
+    }
+  } else {
+    const auto peeked_det = det.PeekGpuReplayInput(det_shape, false);
+    const std::size_t det_elements = std::size_t(3) * det_w * det_h;
+    const bool borrowed_det =
+        peeked_det.resident && peeked_det.live_elements >= det_elements;
+    auto det_input = borrowed_det ? peeked_det
+                                  : det_arena.Acquire(det_elements, "ocr-det-input");
+    if (borrowed_det) det_arena.DeferNextStandaloneSubmit();
+    if (!det_rgb.resident || !det_input.resident ||
+        !det_arena.UploadRgb8(det_rgb, image.rgb.data(), image.rgb.size()) ||
+        !det_arena.ResizeRgbToNchw(det_rgb, det_input, image.width, image.height,
+                                   0, 0, image.width, image.height, det_w, det_h,
+                                   det_norm.scale[0], det_norm.offset[0],
+                                   det_norm.scale[1], det_norm.offset[1],
+                                   det_norm.scale[2], det_norm.offset[2])) {
+      (void)det_arena.FlushDeferredStandalone();
+      if (!borrowed_det) det_arena.Release(det_input);
+      if (!peeked_rgb.resident) det_arena.Release(det_rgb);
+      FailGpuOnly("detector image front end");
+    }
+    if (!keep_page_rgb && !peeked_rgb.resident) det_arena.Release(det_rgb);
+    if (!det.RunGpuOnlyDevice({{"x", {det_shape, det_input}}}, det_outputs)) {
+      if (keep_page_rgb || peeked_rgb.resident) det_arena.Release(det_rgb);
+      FailGpuOnly("detector graph");
+    }
+  }
+  detail::OnnxLite::GpuTensor probability; bool found_probability{};
+  for (auto& [_, value] : det_outputs) if (value.shape.size()==4 && value.shape[1]==1) {
+    probability=std::move(value); found_probability=true; break;
+  }
+  for (auto& [_, value] : det_outputs) if (value.slot.resident && value.slot.index!=probability.slot.index) det_arena.Release(value.slot);
+  if (!found_probability || probability.shape[2]<=0 || probability.shape[3]<=0) {
+    det_arena.Release(probability.slot);
+    if (keep_page_rgb) det_arena.Release(det_rgb);
+    Fail("GPU-only detector probability map not found");
+  }
+  if (std::getenv("PPOCR_GPU_ONLY_TRACE") != nullptr) {
+    std::vector<float> host(probability.slot.live_elements);
+    if (det_arena.Download(host.data(), probability.slot, host.size())) {
+      float minimum = host.empty() ? 0.F : host.front();
+      float maximum = minimum;
+      std::size_t above{};
+      for (float value : host) {
+        minimum = std::min(minimum, value);
+        maximum = std::max(maximum, value);
+        if (value >= opt.det_threshold) ++above;
+      }
+      std::cerr << "GPU-only probability n=" << host.size()
+                << " range=" << minimum << ',' << maximum
+                << " above_thr=" << above << '\n';
+    } else {
+      std::cerr << "GPU-only probability download failed\n";
+    }
+  }
+  // Thresholding, connected components, score filtering, unclip and reading
+  // order now remain on Vulkan.  Only compact final box records cross this
+  // boundary; no detector probability activation is evaluated on CPU.
+  const auto boxes = DBPostDevice(det_arena, probability, 0, image.width,
+                                  image.height, opt);
+  det_arena.Release(probability.slot);
+  // Detector tensors are no longer needed after DB receives its compact map.
+  // Reclaim their parameter slots before the recognizer's substantially
+  // larger backbone is uploaded. This is a device-memory lifetime change,
+  // never a CPU inference fallback.
+  if (!keep_gpu_constants) det.ReleaseGpuConstants();
+  if (!(keep_gpu_constants ? det_arena.ReclaimFreeTransientStorage()
+                            : det_arena.ReclaimFreeStorage())) {
+    if (keep_page_rgb) det_arena.Release(det_rgb);
+    Fail("GPU-only detector-to-recognizer arena reclaim failed");
+  }
+  auto results = RecognizeGpuOnlyCrops(rec, opt, dict, image, boxes,
+                                       keep_page_rgb ? &det_rgb : nullptr);
+  if (keep_page_rgb) det_arena.Release(det_rgb);
+  return results;
+}
+
+// Metal full pipeline, exact front end. The device RGB resize and the
+// axis-aligned bilinear crops above are not the cv2 arithmetic rapidocr uses
+// (cv2.resize INTER_LINEAR for the detector input, getPerspectiveTransform +
+// warpPerspective INTER_CUBIC for each line), so Metal pages drifted from the
+// CPU engine and rapidocr main. Build the detector input with the exact CPU
+// port (DetInput), run the detector graph on the GPU, and hand its
+// probability map to the exact CPU DBPost; recognition then uses the CPU
+// crop/resize ports and batching (OCR::Impl::RecognizeCrops) and uploads
+// those tensors to the GPU recognizer. PPOCR_METAL_DEVICE_FRONTEND=1
+// restores the previous all-device route.
+std::vector<Box> DetectGpuExactInput(detail::OnnxLite& det, detail::OnnxLite& rec,
+                                     const Options& opt, const Image& image,
+                                     bool keep_gpu_constants) {
+  auto& arena = det.gpu_arena();
+  if (!keep_gpu_constants) rec.ReleaseGpuConstants();
+  Tensor input = DetInput(image, opt);
+  if (input.shape.size() != 4) Fail("detector input shape");
+  const std::vector<std::int64_t> shape = input.shape;
+  const std::size_t elements = input.data.size();
+  auto slot = arena.Acquire(elements, "ocr-det-input-exact");
+  if (!slot.resident || !arena.Upload(slot, input.data.data(), elements)) {
+    arena.Release(slot);
+    FailGpuOnly("detector exact input upload");
+  }
+  std::unordered_map<std::string, detail::OnnxLite::GpuTensor> outputs;
+  if (!det.RunGpuOnlyDevice({{"x", {shape, slot}}}, outputs)) FailGpuOnly("detector graph");
+  detail::OnnxLite::GpuTensor probability; bool found{};
+  for (auto& [_, value] : outputs) if (value.shape.size() == 4 && value.shape[1] == 1) {
+    probability = std::move(value); found = true; break;
+  }
+  for (auto& [_, value] : outputs)
+    if (value.slot.resident && (!found || value.slot.index != probability.slot.index)) arena.Release(value.slot);
+  if (!found) Fail("GPU detector probability map not found");
+  auto boxes = DBPostDevice(arena, probability, 0, image.width, image.height, opt);
+  arena.Release(probability.slot);
+  if (!keep_gpu_constants) det.ReleaseGpuConstants();
+  (void)(keep_gpu_constants ? arena.ReclaimFreeTransientStorage() : arena.ReclaimFreeStorage());
+  return boxes;
+}
+
+bool MetalDeviceFrontEnd() {
+  static const bool v = std::getenv("PPOCR_METAL_DEVICE_FRONTEND") != nullptr;
+  return v;
+}
+
+// The strict Vulkan GPU-only graph uses the same exact front end as Metal
+// (CPU DetInput / DBPost / RotateCropImage / batching, det and rec graphs on
+// the GPU), so its text, boxes and word boxes equal the CPU engine.
+// PPOCR_VULKAN_DEVICE_FRONTEND=1 keeps the previous all-device route
+// (device RGB resize, axis-aligned bilinear crops).
+bool VulkanDeviceFrontEnd() {
+  static const bool v = std::getenv("PPOCR_VULKAN_DEVICE_FRONTEND") != nullptr;
+  return v;
+}
+
+// GPU-only detector batch for pages that naturally share the same PP-OCR
+// resize shape.  The RGB front end and detector graph both run with a real N
+// dimension; per-page DB post-processing remains the required control-plane
+// boundary.  Recognizer batching is intentionally left to a later device
+// scheduler because attention's dynamic sequence widths need their own exact
+// padding/CTC-prefix contract.
+std::vector<std::vector<Box>> DetectGpuOnlyBatch(
+    detail::OnnxLite& det, detail::OnnxLite& rec, const Options& opt,
+    const std::vector<Image>& images, const std::vector<std::size_t>& pages,
+    int width, int height, bool keep_gpu_constants) {
+  auto& arena = det.gpu_arena();
+  if (!keep_gpu_constants) rec.ReleaseGpuConstants();
+  if (!(keep_gpu_constants ? arena.ReclaimFreeTransientStorage() : arena.ReclaimFreeStorage()))
+    Fail("GPU-only detector batch arena reclaim failed");
+  const std::size_t batches = pages.size();
+  if (batches == 0) return {};
+  const std::size_t rgb_per_page = std::size_t(images[pages[0]].width) * images[pages[0]].height * 3;
+  // A bucket contains pages with the same detector output geometry, but not
+  // necessarily the same original size. Pack only an exactly matching source
+  // geometry here; callers split other pages into their own batch.
+  auto rgb = arena.Acquire(rgb_per_page * batches, "ocr-det-rgb-batch");
+  auto input = arena.Acquire(std::size_t(3) * width * height * batches, "ocr-det-input-batch");
+  if (!rgb.resident || !input.resident) { arena.Release(input); arena.Release(rgb); Fail("GPU-only detector batch allocation failed"); }
+  auto* mapped = reinterpret_cast<std::uint8_t*>(arena.mapped_data(rgb));
+  if (!mapped) { arena.Release(input); arena.Release(rgb); Fail("GPU-only detector batch map failed"); }
+  for (std::size_t item = 0; item < batches; ++item) {
+    const auto& image = images[pages[item]];
+    if (image.rgb.size() != rgb_per_page) { arena.Release(input); arena.Release(rgb); Fail("GPU-only detector batch source shape mismatch"); }
+    std::memcpy(mapped + item * rgb_per_page, image.rgb.data(), rgb_per_page);
+  }
+  const std::size_t rgb_float_elements =
+      (rgb_per_page * batches + sizeof(float) - 1) / sizeof(float);
+  if (!arena.FlushHostWrites(rgb, rgb_float_elements) ||
+      !arena.ResizeRgbBatchToNchw(rgb, input, static_cast<int>(batches), images[pages[0]].width,
+                                  images[pages[0]].height, width, height)) {
+    arena.Release(input); arena.Release(rgb); FailGpuOnly("detector batch front end");
+  }
+  arena.Release(rgb);
+  std::unordered_map<std::string, detail::OnnxLite::GpuTensor> outputs;
+  if (!det.RunGpuOnlyDevice({{"x", {{static_cast<std::int64_t>(batches),3,height,width}, input}}}, outputs)) {
+    FailGpuOnly("detector batch graph");
+  }
+  detail::OnnxLite::GpuTensor probability; bool found{};
+  for (auto& [_, value] : outputs) if (value.shape.size() == 4 && value.shape[0] == static_cast<std::int64_t>(batches) && value.shape[1] == 1) {
+    probability = std::move(value); found = true; break;
+  }
+  for (auto& [_, value] : outputs) if (value.slot.resident && value.slot.index != probability.slot.index) arena.Release(value.slot);
+  if (!found) { arena.Release(probability.slot); Fail("GPU-only detector batch probability map not found"); }
+  std::vector<std::vector<Box>> result(batches);
+  for (std::size_t item = 0; item < batches; ++item) {
+    result[item] = DBPostDevice(arena, probability, item,
+                                images[pages[item]].width, images[pages[item]].height, opt);
+  }
+  arena.Release(probability.slot);
+  if (!keep_gpu_constants) det.ReleaseGpuConstants();
+  if (!(keep_gpu_constants ? arena.ReclaimFreeTransientStorage() : arena.ReclaimFreeStorage()))
+    Fail("GPU-only detector batch post reclaim failed");
+  return result;
+}
+BackendInfo QueryBackendInfo() { return detail::QueryVulkanBackendInfo(); }
+CpuInfo QueryCpuInfo() {
+  const auto isa = detail::kernels::QueryIsa();
+  CpuInfo info;
+  info.avx2_compiled = isa.avx2_compiled;
+  info.avx512_compiled = isa.avx512_compiled;
+  info.neon_compiled = isa.neon_compiled;
+  info.avx2 = isa.avx2;
+  info.avx512 = isa.avx512;
+  info.neon = isa.neon;
+  info.active_isa = isa.active ? isa.active : "scalar";
+  info.threads = isa.threads;
+  return info;
+}
+bool MetalAvailable() {
+  return detail::MetalBackendBuilt() && detail::MetalDeviceAvailable();
+}
+OCR::OCR(const std::string& det_model,const std::string& rec_model,std::string dictionary_path,Options options) {
+  const bool lite_dir = indra::LiteEngine::IsLiteDir(det_model);
+  if (options.model_type == ModelType::lite && !lite_dir)
+    Fail("model_type=lite needs det_model to be a lite model folder containing meta.json");
+  if (options.model_type == ModelType::ppocr && lite_dir)
+    Fail("model_type=ppocr, but det_model is a lite model folder (meta.json)");
+  if (lite_dir) {  // model type "lite": rec_model / dictionary unused
+    const int hw = static_cast<int>(std::thread::hardware_concurrency());
+    const int threads = std::max(1, hw > 0 ? std::min(options.rec_parallelism, hw) : options.rec_parallelism);
+    options.backend = Backend::cpu_only;
+    impl_ = std::make_unique<Impl>(std::make_shared<indra::LiteEngine>(det_model, threads), options);
+    impl_->backend_note = impl_->lite->Note();
+    return;
+  }
+  if (options.vulkan_device_index >= 0)
+    detail::RequestVulkanDeviceIndex(options.vulkan_device_index);
+  if (options.backend == Backend::metal) {
+    // Metal runs the GPU-only graph. Anything missing (not built, no
+    // device, Vulkan already chosen for this process, or an incomplete
+    // graph) keeps the CPU path rather than failing construction.
+    std::string note;
+    if (!detail::MetalBackendBuilt()) {
+      note = "this library was built without Metal";
+    } else if (!detail::MetalDeviceAvailable()) {
+      note = "no Metal device (or PPOCR_DISABLE_METAL is set)";
+    } else if (!detail::RequestMetalDriver() || !detail::MetalDriverRequested()) {
+      note = "the GPU runtime of this process was already initialized for Vulkan "
+             "(a Vulkan/hybrid engine or rpocr_query_backend_info ran before the first "
+             "Metal engine); Metal can only be chosen before that";
+    } else if (!QueryBackendInfo().full_graph_gpu_available) {
+      note = "the Metal GPU graph is unavailable";
+    }
+    if (note.empty()) {
+      options.backend = Backend::gpu_only;
+      impl_ = std::make_unique<Impl>(det_model, rec_model, options);
+      if (!impl_->det.SupportsGpuOnly() || !impl_->rec.SupportsGpuOnly()) {
+        impl_.reset();
+        note = "the detector or recognizer has operators without a GPU kernel";
+      } else {
+        impl_->metal = true;
+      }
+    }
+    if (!impl_) {
+      std::fprintf(stderr, "ppocr: Metal backend requested but not used (%s); using CPU\n",
+                   note.c_str());
+      options.backend = Backend::cpu_only;
+      impl_ = std::make_unique<Impl>(det_model, rec_model, options);
+      impl_->backend_note = std::move(note);
+    }
+    impl_->dict = ReadDict(dictionary_path);
+    impl_->LoadClassifier(options);
+    return;
+  }
+  impl_=std::make_unique<Impl>(det_model,rec_model,options);
+  if (options.backend == Backend::gpu_only &&
+      (!QueryBackendInfo().full_graph_gpu_available || !impl_->det.SupportsGpuOnly() ||
+       !impl_->rec.SupportsGpuOnly())) {
+    Fail("GPU-only was requested, but the complete PP-OCRv6 Vulkan graph is unavailable");
+  }
+  impl_->dict=ReadDict(dictionary_path);
+  impl_->LoadClassifier(options);
+}
+Backend OCR::ActiveBackend() const noexcept {
+  return impl_->metal ? Backend::metal : impl_->opt.backend;
+}
+const std::string& OCR::BackendNote() const noexcept { return impl_->backend_note; }
+OCR::~OCR()=default;OCR::OCR(OCR&&) noexcept=default;OCR& OCR::operator=(OCR&&) noexcept=default;
+void OCR::SetDetectionThresholds(float det_threshold, float det_box_threshold,
+                                 float det_unclip_ratio) {
+  if (!(det_threshold > 0.F && det_threshold < 1.F) ||
+      !(det_box_threshold > 0.F && det_box_threshold < 1.F) ||
+      !(det_unclip_ratio > 0.F)) {
+    Fail("detection thresholds out of range");
+  }
+  if (impl_->lite) return;  // Indra's line decoder has fixed thresholds
+  std::lock_guard lock(impl_->recognize_mutex);
+  impl_->opt.det_threshold = det_threshold;
+  impl_->opt.det_box_threshold = det_box_threshold;
+  impl_->opt.det_unclip_ratio = det_unclip_ratio;
+}
+namespace {
+// Packed-RGB crop owned by one recognition call.
+struct CropImage { std::vector<std::uint8_t> rgb; int w{}, h{}; };
+struct ClsOutcome { int label{-1}; float score{}; bool rotated{false}; };
+
+// cv2.rotate(img, cv2.ROTATE_180) on packed RGB.
+void Rotate180(CropImage& crop) {
+  const std::size_t pixels = std::size_t(crop.w) * std::size_t(crop.h);
+  std::uint8_t* p = crop.rgb.data();
+  for (std::size_t a = 0, b = pixels; a + 1 < b; ++a) {
+    --b;
+    for (int c = 0; c < 3; ++c) std::swap(p[a * 3 + c], p[b * 3 + c]);
+  }
+}
+
+bool EnvFlag(const char* name, bool fallback) {
+  const char* v = std::getenv(name);
+  if (!v || !*v) return fallback;
+  const std::string_view s{v};
+  if (s == "0" || s == "false" || s == "False" || s == "FALSE" || s == "off" || s == "no") return false;
+  return true;
+}
+
+// rapidocr main ch_ppocr_cls.TextClassifier.__call__ (head 8ac45f4, #748):
+// lines sorted by w/h, batches of cls_batch_num, every line cv2.resize'd
+// (INTER_LINEAR) to (min(cls_w, ceil(cls_h * w/h)), cls_h), scaled to
+// [-1, 1] in float32 and right-padded with zeros to cls_w. With the v2.0
+// model (cls_crop_long_lines) a line wider than ceil(h * cls_w / cls_h) is
+// first cut to its horizontal centre at that width. Arg-max over the softmax
+// gives the label; label 1 ("180") above cls_thresh rotates the crop 180.
+// Each line's tensor is independent of its batch, so the batch order only
+// affects speed.
+void ClassifyCrops(const detail::OnnxLite& cls, const Options& opt, std::vector<CropImage>& crops,
+                   std::vector<ClsOutcome>& out) {
+  const std::size_t n = crops.size();
+  out.assign(n, ClsOutcome{});
+  if (n == 0) return;
+  const int ch = std::max(1, opt.cls_height), cw = std::max(1, opt.cls_width);
+  std::vector<std::size_t> order(n);
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    return crops[a].w / static_cast<double>(crops[a].h) < crops[b].w / static_cast<double>(crops[b].h);
+  });
+  const auto lut = detail::cvc::RecNormalizeTable(0.5F, 0.5F);
+  // Every line is padded to the fixed cls_width, so a line's tensor does not
+  // depend on which lines share its batch (rapidocr main batches by
+  // cls_batch_num only to bound memory). Running up to PPOCR_CLS_EXEC_BATCH
+  // (default 32) lines per graph call amortizes the ~90 per-node dispatches
+  // and lets the batched depthwise/pointwise kernels spread work over threads.
+  static const int exec_batch = [] {
+    const char* v = std::getenv("PPOCR_CLS_EXEC_BATCH");
+    const int parsed = v ? std::atoi(v) : 0;
+    return parsed > 0 ? std::min(parsed, 256) : 32;
+  }();
+  const std::size_t max_batch = static_cast<std::size_t>(
+      std::max({1, opt.cls_batch_size, exec_batch}));
+  const std::size_t workers = static_cast<std::size_t>(std::max(1, opt.batch_preprocess_parallelism));
+  const std::size_t stride = std::size_t(3) * ch * cw;
+  const std::string& output_name = cls.outputs().empty() ? std::string{} : cls.outputs().front();
+  for (std::size_t first = 0; first < n; first += max_batch) {
+    const std::size_t count = std::min(max_batch, n - first);
+    Tensor input{{static_cast<std::int64_t>(count), 3, ch, cw},
+                 std::vector<float>(count * stride, 0.F)};
+    RunIndexed(count, std::min(count, workers), [&](std::size_t k) {
+      const CropImage& crop = crops[order[first + k]];
+      int w = crop.w;
+      const int h = crop.h;
+      const std::uint8_t* src = crop.rgb.data();
+      if (opt.cls_crop_long_lines) {
+        const int keep_w = static_cast<int>(std::ceil(h * cw / static_cast<double>(ch)));
+        if (w > keep_w) {
+          const int left = (w - keep_w) / 2;
+          src += std::size_t(left) * 3;
+          w = keep_w;
+        }
+      }
+      const int resized_w = detail::cvc::RecResizedWidth(w, h, ch, cw);
+      thread_local std::vector<std::uint8_t> resized;
+      resized.resize(std::size_t(resized_w) * ch * 3);
+      detail::cvc::ResizeLinear8u(src, w, h, std::size_t(crop.w) * 3, 3, resized.data(),
+                                  resized_w, ch, std::size_t(resized_w) * 3);
+      float* const blue = input.data.data() + k * stride;
+      float* const green = blue + std::size_t(ch) * cw;
+      float* const red = green + std::size_t(ch) * cw;
+      for (int y = 0; y < ch; ++y) {
+        const std::uint8_t* rgb = resized.data() + std::size_t(y) * resized_w * 3;
+        const std::size_t row = std::size_t(y) * cw;
+        for (int x = 0; x < resized_w; ++x, rgb += 3) {
+          blue[row + x] = lut[rgb[2]];
+          green[row + x] = lut[rgb[1]];
+          red[row + x] = lut[rgb[0]];
+        }
+      }
+    });
+    std::unordered_map<std::string, Tensor> feed;
+    feed.emplace("x", std::move(input));
+    auto result = cls.Run(std::move(feed));
+    const Tensor* prob = nullptr;
+    if (const auto it = result.find(output_name); it != result.end()) prob = &it->second;
+    if (!prob) {
+      for (const auto& [_, t] : result) {
+        if (t.shape.size() == 2 && t.shape[0] == static_cast<std::int64_t>(count)) { prob = &t; break; }
+      }
+    }
+    if (!prob || prob->shape.size() != 2 || prob->shape[0] != static_cast<std::int64_t>(count) ||
+        prob->shape[1] < 1) {
+      Fail("classifier output [N, classes] not found");
+    }
+    const std::size_t classes = static_cast<std::size_t>(prob->shape[1]);
+    for (std::size_t k = 0; k < count; ++k) {
+      const float* row = prob->data.data() + k * classes;
+      std::size_t best = 0;
+      for (std::size_t c = 1; c < classes; ++c) if (row[c] > row[best]) best = c;  // np.argmax: first max
+      const std::size_t index = order[first + k];
+      const bool rotate = best == 1 && row[best] > opt.cls_thresh;
+      out[index] = {static_cast<int>(best), row[best], rotate};
+      if (rotate) Rotate180(crops[index]);
+    }
+  }
+}
+}  // namespace
+
+void OCR::Impl::LoadClassifier(const Options& o) {
+  cls_default = EnvFlag("PPOCR_USE_CLS", o.use_cls);
+  std::string path = o.cls_model;
+  if (path.empty()) {
+    if (const char* env = std::getenv("PPOCR_CLS_MODEL")) path = env;
+  }
+  if (path.empty()) return;
+  // CPU graph regardless of backend: the classifier is small and the CPU
+  // kernels give the same result on every ISA.
+  cls = detail::OnnxLite(path, Backend::cpu_only);
+  cls_loaded = true;
+}
+bool OCR::ClsEnabled() const noexcept { return impl_ && impl_->cls_loaded && impl_->cls_default; }
+bool OCR::ClsLoaded() const noexcept { return impl_ && impl_->cls_loaded; }
+void OCR::SetRecOrder(RecOrderFn fn) {
+  if (impl_) impl_->rec_order = std::move(fn);
+}
+
+// rapidocr 3.10 recognition front end (TextRecognizer.__call__ after
+// get_rotate_crop_image): crops sorted by w/h, consecutive groups of
+// rec_batch_num, each padded to int(48 * max(320/48, max w/h)), every crop
+// cv2.resize'd (INTER_LINEAR) to ceil(48 * w/h) and normalized in float32.
+// cv_compat reproduces OpenCV's crop and resize bit for bit, so the input
+// tensors equal 3.10's. use_det=false recognizes the whole image unrotated.
+std::vector<Result> OCR::Impl::RecognizeCrops(const Image& image, const std::vector<Box>& boxes,
+                                              bool use_det, bool profile_e2e, bool use_cls,
+                                              bool rec_on_gpu) {
+  const std::size_t n = boxes.size();
+  const bool classify = use_cls && cls_loaded && n > 0;
+  // The classifier may rotate a line, so it needs its own copy of the
+  // whole image when use_det=false.
+  const bool own_crops = use_det || classify;
+  std::vector<CropImage> crops(own_crops ? n : 0);
+  if (!use_det && classify) {
+    crops[0].rgb = image.rgb;
+    crops[0].w = image.width;
+    crops[0].h = image.height;
+  }
+  const auto crop_t0 = profile_e2e ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+  if (use_det) {
+    RunIndexed(n, static_cast<std::size_t>(std::max(1, opt.batch_preprocess_parallelism)),
+               [&](std::size_t i) {
+      float pts[8];
+      for (int k = 0; k < 4; ++k) {
+        pts[2 * k] = boxes[i].p[static_cast<std::size_t>(k)].x;
+        pts[2 * k + 1] = boxes[i].p[static_cast<std::size_t>(k)].y;
+      }
+      detail::cvc::RotateCropImage(image.rgb.data(), image.width, image.height, pts,
+                                   crops[i].rgb, crops[i].w, crops[i].h);
+    });
+  }
+  std::vector<ClsOutcome> orientation;
+  if (classify) {
+    const auto cls_t0 = profile_e2e ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    ClassifyCrops(cls, opt, crops, orientation);
+    if (profile_e2e) {
+      std::cerr << "e2e_ms cls=" << std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - cls_t0).count()
+                << " lines=" << n << '\n';
+    }
+  }
+  const auto crop_rgb = [&](std::size_t i) {
+    return own_crops ? crops[i].rgb.data() : image.rgb.data();
+  };
+  const auto crop_w = [&](std::size_t i) { return own_crops ? crops[i].w : image.width; };
+  const auto crop_h = [&](std::size_t i) { return own_crops ? crops[i].h : image.height; };
+  std::vector<std::size_t> order(n);
+  std::iota(order.begin(), order.end(), std::size_t{0});
+  std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+    return crop_w(a) / static_cast<double>(crop_h(a)) < crop_w(b) / static_cast<double>(crop_h(b));
+  });
+  const int rec_h = opt.rec_height;
+  const int rec_w = rec_h * 320 / 48;
+  // rapidocr main: indices = np.argsort(np.array(width_list)), NumPy's
+  // default (unstable) argsort, reproduced natively (np_argsort.hpp). An
+  // OCR::SetRecOrder callback overrides it.
+  const auto apply_rec_order = [&] {
+    if (n < 2) return;
+    std::vector<double> ratios(n);
+    for (std::size_t i = 0; i < n; ++i) ratios[i] = crop_w(i) / static_cast<double>(crop_h(i));
+    if (rec_order) {
+      std::vector<std::size_t> custom(n, n);
+      rec_order(ratios, custom);
+      bool valid = custom.size() == n;
+      std::vector<char> seen(n, 0);
+      for (std::size_t k = 0; valid && k < n; ++k) {
+        const std::size_t i = custom[k];
+        if (i >= n || seen[i]) valid = false;
+        else seen[i] = 1;
+      }
+      if (valid) {
+        order.swap(custom);
+        return;
+      }
+    }
+    detail::NumpyArgsort(ratios.data(), n, order.data());
+  };
+  const std::size_t max_batch = static_cast<std::size_t>(std::max(1, opt.rec_batch_size));
+  struct Batch { int width; const std::size_t* indices; std::size_t count; double max_ratio; };
+  std::vector<Batch> batches;
+  static const int fast_env = [] {
+    const char* v = std::getenv("PPOCR_REC_FAST");
+    if (!v || !*v) return -1;
+    return (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0) ? 0 : 1;
+  }();
+  const bool fast = fast_env >= 0 ? fast_env == 1 : opt.rec_fast_mode;
+  std::vector<std::size_t> fast_order;
+  if (fast) {
+    // Fast mode: each line keeps its own resized width (no 3.10 batch padding
+    // and no 320 minimum). On x86 widths are rounded up to 32 so nearby lines
+    // share an NCHW batch (PPOCR_REC_WIDTH_ALIGN / PPOCR_DISABLE_REC_WIDTH_ALIGN);
+    // AArch64 keeps exact widths. Crop and resize stay the 3.10 ports.
+    static const int width_align = [] {
+      if (std::getenv("PPOCR_DISABLE_REC_WIDTH_ALIGN") != nullptr) return 0;
+      const char* configured = std::getenv("PPOCR_REC_WIDTH_ALIGN");
+      if (configured && *configured) {
+        char* end = nullptr;
+        const long parsed = std::strtol(configured, &end, 10);
+        if (end != configured && *end == '\0' && parsed >= 0 && parsed <= 4096)
+          return static_cast<int>(parsed);
+      }
+#if defined(__aarch64__) || defined(_M_ARM64)
+      return 0;
+#else
+      return 32;
+#endif
+    }();
+    const int max_w = std::max(1, opt.rec_max_width);
+    std::vector<int> bucket(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const int natural = detail::cvc::RecResizedWidth(crop_w(i), crop_h(i), rec_h, max_w);
+      int w = natural;
+      if (width_align > 1 && natural < max_w)
+        w = std::min((natural + width_align - 1) / width_align * width_align, max_w);
+      // use_det=false (single line): keep 3.x's right padding to at least
+      // rec_height*320/48; short lines decode worse without it.
+      if (!use_det && std::getenv("PPOCR_REC_FAST_NO_MIN") == nullptr) w = std::max(w, std::min(max_w, rec_w));
+      bucket[i] = w;
+    }
+    fast_order = order;
+    std::stable_sort(fast_order.begin(), fast_order.end(),
+                     [&](std::size_t x, std::size_t y) { return bucket[x] < bucket[y]; });
+    for (std::size_t first = 0; first < n;) {
+      const int width = bucket[fast_order[first]];
+      std::size_t count = 0;
+      while (first + count < n && count < max_batch && bucket[fast_order[first + count]] == width)
+        ++count;
+      batches.push_back({width, fast_order.data() + first, count, width / static_cast<double>(rec_h)});
+      first += count;
+    }
+  }
+  if (!fast) apply_rec_order();
+  for (std::size_t first = 0; !fast && first < n; first += max_batch) {
+    const std::size_t count = std::min(max_batch, n - first);
+    double max_ratio = rec_w / static_cast<double>(rec_h);
+    for (std::size_t k = 0; k < count; ++k) {
+      const std::size_t i = order[first + k];
+      max_ratio = std::max(max_ratio, crop_w(i) * 1.0 / crop_h(i));
+    }
+    const int width = std::min(static_cast<int>(rec_h * max_ratio), std::max(1, opt.rec_max_width));
+    batches.push_back({width, order.data() + first, count, max_ratio});
+  }
+  std::array<std::array<float, 256>, 3> lut{};
+  for (std::size_t c = 0; c < 3; ++c)
+    lut[c] = detail::cvc::RecNormalizeTable(opt.rec_mean[c], opt.rec_std[c]);
+  std::vector<Result> out(n);
+  const auto recognition_parallelism = opt.backend == Backend::hybrid && hybrid_gpu_graph_state > 0
+      ? opt.hybrid_graph_parallelism : opt.rec_parallelism;
+  // rec_on_gpu (Metal): the exact CPU tensors go through the one GPU queue,
+  // so batches run in order on the calling thread.
+  const auto workers = rec_on_gpu ? std::size_t{1} : std::min<std::size_t>(batches.size(),
+      RecognitionWorkerLimit(opt.backend, recognition_parallelism));
+  const auto rec_preprocess_workers = std::max<std::size_t>(
+      1, std::size_t(std::max(1, opt.batch_preprocess_parallelism)) /
+             std::max<std::size_t>(1, workers));
+  const auto run_batch = [&](const Batch& batch) {
+    const auto rec_t0 = profile_e2e ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+    int inner_cap = 0;
+    if (workers >= 4 && std::getenv("PPOCR_DISABLE_INNER_PARALLELISM_CAP") == nullptr) {
+      inner_cap = 8;
+      if (const char* configured = std::getenv("PPOCR_BENCH_THREADS")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(configured, &end, 10);
+        if (end != configured && *end == '\0' && parsed > 0)
+          inner_cap = std::max(2, int(parsed) / int(workers));
+      }
+    }
+    detail::kernels::InnerParallelismGuard inner_guard(inner_cap);
+    const int width = batch.width;
+    Tensor input{{static_cast<std::int64_t>(batch.count), 3, rec_h, width},
+                 std::vector<float>(batch.count * std::size_t(3) * rec_h * width, 0.F)};
+    const std::size_t stride = std::size_t(3) * rec_h * width;
+    RunIndexed(batch.count, rec_preprocess_workers, [&](std::size_t k) {
+      const std::size_t i = batch.indices[k];
+      const int w = crop_w(i), h = crop_h(i);
+      const int resized_w = detail::cvc::RecResizedWidth(w, h, rec_h, width);
+      thread_local std::vector<std::uint8_t> resized;
+      resized.resize(std::size_t(resized_w) * rec_h * 3);
+      detail::cvc::ResizeLinear8u(crop_rgb(i), w, h, std::size_t(w) * 3, 3, resized.data(),
+                                  resized_w, rec_h, std::size_t(resized_w) * 3);
+      float* const blue = input.data.data() + k * stride;
+      float* const green = blue + std::size_t(rec_h) * width;
+      float* const red = green + std::size_t(rec_h) * width;
+      for (int y = 0; y < rec_h; ++y) {
+        const std::uint8_t* rgb = resized.data() + std::size_t(y) * resized_w * 3;
+        const std::size_t row = std::size_t(y) * width;
+        for (int x = 0; x < resized_w; ++x, rgb += 3) {
+          blue[row + x] = lut[0][rgb[2]];
+          green[row + x] = lut[1][rgb[1]];
+          red[row + x] = lut[2][rgb[0]];
+        }
+      }
+    });
+    std::unordered_map<std::string, Tensor> rec_input;
+    rec_input.emplace("x", std::move(input));
+    const auto rec_t1 = profile_e2e ? std::chrono::steady_clock::now() : rec_t0;
+    detail::OnnxLite::CtcTop1Output logits;
+    if (rec_on_gpu) {
+      auto& arena = rec.gpu_arena();
+      Tensor& host = rec_input.at("x");
+      const std::vector<std::int64_t> shape = host.shape;
+      const std::size_t elements = host.data.size();
+      auto slot = arena.Acquire(elements, "ocr-rec-input-exact");
+      if (!slot.resident || !arena.Upload(slot, host.data.data(), elements)) {
+        arena.Release(slot);
+        FailGpuOnly("recognizer exact input upload");
+      }
+      if (!rec.RunGpuOnlyCtcTop1({{"x", {shape, slot}}}, logits))
+        FailGpuOnly("recognizer batch/CTC graph");
+    } else {
+      logits = rec.RunCtcTop1(std::move(rec_input));
+    }
+    if (profile_e2e) {
+      std::cerr << "e2e_ms rec_pre="
+                << std::chrono::duration<double, std::milli>(rec_t1 - rec_t0).count()
+                << " rec_run="
+                << std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - rec_t1).count()
+                << " width=" << width << '\n';
+    }
+    if (logits.batches != static_cast<int>(batch.count)) Fail("recognizer logits not found");
+    for (std::size_t k = 0; k < batch.count; ++k) {
+      auto [text, confidence] = DecodeCTC(logits, k, dict);
+      const auto result_index = batch.indices[k];
+      out[result_index] = MakeResult(boxes[result_index], std::move(text), confidence);
+      Result& r = out[result_index];
+      r.rec_steps = DecodeCTCChars(logits, k, r.char_cols, r.char_probs);
+      r.crop_width = crop_w(result_index);
+      r.crop_height = crop_h(result_index);
+      r.rec_max_wh_ratio = batch.max_ratio;
+    }
+  };
+  // Longest-first packing onto the IndexExecutor's contiguous blocks (see
+  // the scheduling note in RecognizeBatch); outputs are indexed, so the
+  // decoded text does not depend on this order.
+  if (workers > 1 && batches.size() > workers &&
+      std::getenv("PPOCR_DISABLE_REC_LPT") == nullptr) {
+    const int count = static_cast<int>(batches.size());
+    const int active = static_cast<int>(workers);
+    const int block = (count + active - 1) / active;
+    std::vector<int> idx(static_cast<std::size_t>(count));
+    std::iota(idx.begin(), idx.end(), 0);
+    const auto cost = [&](int b) {
+      const auto& batch = batches[static_cast<std::size_t>(b)];
+      return batch.width * static_cast<int>(batch.count);
+    };
+    std::stable_sort(idx.begin(), idx.end(), [&](int a, int b) { return cost(a) > cost(b); });
+    std::vector<int> load(static_cast<std::size_t>(active)), fill(static_cast<std::size_t>(active));
+    std::vector<Batch> balanced(batches.size());
+    for (int index : idx) {
+      int best = 0;
+      bool found = false;
+      for (int worker = 0; worker < active; ++worker) {
+        const int cap = std::min(block, count - worker * block);
+        if (cap <= 0 || fill[static_cast<std::size_t>(worker)] >= cap) continue;
+        if (!found || load[static_cast<std::size_t>(worker)] < load[static_cast<std::size_t>(best)]) {
+          best = worker;
+          found = true;
+        }
+      }
+      const int slot = best * block + fill[static_cast<std::size_t>(best)];
+      balanced[static_cast<std::size_t>(slot)] = batches[static_cast<std::size_t>(index)];
+      load[static_cast<std::size_t>(best)] += cost(index);
+      ++fill[static_cast<std::size_t>(best)];
+    }
+    batches.swap(balanced);
+  }
+  const auto rec_begin = profile_e2e ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+  if (workers <= 1) {
+    for (const auto& batch : batches) run_batch(batch);
+  } else {
+    std::exception_ptr failure;
+    std::mutex failure_mutex;
+    IndexExecutor().Run(static_cast<int>(batches.size()), static_cast<int>(workers),
+                        [&](int first, int last) {
+      try {
+        for (int task = first; task < last; ++task)
+          run_batch(batches[static_cast<std::size_t>(task)]);
+      } catch (...) {
+        std::lock_guard lock(failure_mutex);
+        if (!failure) failure = std::current_exception();
+      }
+    });
+    if (failure) std::rethrow_exception(failure);
+  }
+  if (profile_e2e) {
+    const auto now = std::chrono::steady_clock::now();
+    std::cerr << "e2e_ms crop=" << std::chrono::duration<double, std::milli>(rec_begin - crop_t0).count()
+              << " rec=" << std::chrono::duration<double, std::milli>(now - rec_begin).count()
+              << " boxes=" << n << " rec_batches=" << batches.size() << '\n';
+  }
+  for (std::size_t i = 0; i < orientation.size(); ++i) {
+    out[i].cls_label = orientation[i].label;
+    out[i].cls_score = orientation[i].score;
+    out[i].rotated_180 = orientation[i].rotated;
+  }
+  return out;
+}
+
+std::vector<Result> OCR::Recognize(const Image& image) const { return Run(image, true, true); }
+std::vector<Result> OCR::Run(const Image& image, bool use_det, bool use_rec) const {
+  return Run(image, use_det, use_rec, impl_->cls_default);
+}
+
+namespace {
+std::vector<Result> LiteResults(const std::vector<indra::LiteLine>& lines) {
+  std::vector<Result> out;
+  out.reserve(lines.size());
+  for (const auto& l : lines) {
+    Result r;
+    r.text = l.text;
+    r.confidence = l.conf;
+    const int x0 = static_cast<int>(std::lround(l.x0)), y0 = static_cast<int>(std::lround(l.y0));
+    const int x1 = static_cast<int>(std::lround(l.x1)), y1 = static_cast<int>(std::lround(l.y1));
+    r.bbox = {x0, y0, x1 - x0, y1 - y0};
+    r.box = {{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}}};
+    // return_word_box: the line box is the crop; one CTC step per `step`
+    // of its width, so main's line_txt_len equals rec_steps.
+    if (!l.char_x.empty() && l.step > 0.F && x1 > x0 && y1 > y0) {
+      r.crop_width = x1 - x0;
+      r.crop_height = y1 - y0;
+      // main treats h / w >= 1.5 as vertical text (crop turned 90 degrees).
+      if (r.crop_height * 1.0 / r.crop_width >= 1.5) std::swap(r.crop_width, r.crop_height);
+      r.rec_steps = std::max(1, static_cast<int>(std::lround(1.0 / l.step)));
+      r.rec_max_wh_ratio = r.crop_width / static_cast<double>(r.crop_height);
+      for (std::size_t k = 0; k < l.char_x.size(); ++k) {
+        r.char_cols.push_back(std::clamp(static_cast<int>(std::floor(l.char_x[k] * r.rec_steps)), 0,
+                                         r.rec_steps - 1));
+        r.char_probs.push_back(l.char_probs[k]);
+        // one CTC step per character at most (main's selection is a set)
+        if (k > 0 && r.char_cols[k] <= r.char_cols[k - 1]) r.char_cols[k] = r.char_cols[k - 1] + 1;
+      }
+      r.rec_steps = std::max(r.rec_steps, r.char_cols.back() + 1);
+    }
+    out.push_back(std::move(r));
+  }
+  return out;
+}
+}  // namespace
+
+std::vector<Result> OCR::Run(const Image& image, bool use_det, bool use_rec,
+                             bool use_cls) const {
+  if (!use_det && !use_rec && !(use_cls && !impl_->lite))
+    Fail("use_det and use_rec cannot both be false");
+  if (impl_->lite) {
+    if (image.empty()) Fail("empty image");
+    return LiteResults(impl_->lite->Run(image.rgb.data(), image.width, image.height,
+                                        (use_det ? 1 : 0) | (use_rec ? 2 : 0)));
+  }
+  if (!use_det && !use_rec) {
+    // Classification only (rapidocr main use_det=False, use_rec=False,
+    // use_cls=True): the whole image is one line.
+    if (!impl_->cls_loaded) Fail("use_cls=true needs a classifier model (cls_model)");
+    if (image.empty()) Fail("invalid RGB image");
+    std::lock_guard lock(impl_->recognize_mutex);
+    detail::kernels::FloatModeGuard float_mode;
+    std::vector<CropImage> crops(1);
+    crops[0] = {image.rgb, image.width, image.height};
+    std::vector<ClsOutcome> orientation;
+    ClassifyCrops(impl_->cls, impl_->opt, crops, orientation);
+    Box whole;
+    const float w = float(image.width), h = float(image.height);
+    whole.p = {Point{0.F, 0.F}, Point{w, 0.F}, Point{w, h}, Point{0.F, h}};
+    auto r = MakeResult(whole, std::string{}, 0.F);
+    r.cls_label = orientation[0].label;
+    r.cls_score = orientation[0].score;
+    r.rotated_180 = orientation[0].rotated;
+    return {std::move(r)};
+  }
+  const bool classify = use_cls && impl_->cls_loaded;
+  const bool full = use_det && use_rec;
+  const bool gpu_graph = impl_->opt.backend == Backend::gpu_only;
+  const bool exact_front = gpu_graph && (impl_->metal ? !MetalDeviceFrontEnd() : !VulkanDeviceFrontEnd());
+  if (classify && gpu_graph && !exact_front) {
+    static std::once_flag logged_cls;
+    std::call_once(logged_cls, [] {
+      std::fprintf(stderr, "ppocr: the strict GPU-only graph does not run the text-line "
+                           "orientation classifier; use the cpu, hybrid or metal backend for use_cls\n");
+    });
+  }
+  // Metal runs the full det+rec pipeline on the GPU. Detection-only and
+  // recognition-only requests use the CPU graph of the same models (same
+  // text as Backend::cpu_only); strict Vulkan gpu_only still refuses them.
+  const bool partial_on_cpu = !full && impl_->metal;
+  if (!full && impl_->opt.backend == Backend::gpu_only && !partial_on_cpu) {
+    throw UnsupportedError("ppocr: use_det=false or use_rec=false runs on the CPU graph; "
+                           "the gpu_only backend does not fall back to it");
+  }
+  if (partial_on_cpu) {
+    static std::once_flag logged;
+    std::call_once(logged, [] {
+      std::fprintf(stderr, "ppocr: use_det=false / use_rec=false run on the CPU graph; "
+                           "Metal is used for the full pipeline\n");
+    });
+  }
+  std::lock_guard lock(impl_->recognize_mutex);
+  detail::kernels::FloatModeGuard float_mode;
+  std::unique_lock<std::recursive_mutex> gpu_lock(SharedGpuMutex(), std::defer_lock);
+  if (impl_->opt.backend != Backend::cpu_only) gpu_lock.lock();
+  if(image.empty()) Fail("invalid RGB image");
+  if(impl_->det.outputs().empty()) Fail("detector has no output");
+  if (exact_front && full) {
+    const bool profile_e2e = std::getenv("PPOCR_PROFILE_E2E") != nullptr;
+    const auto boxes = DetectGpuExactInput(impl_->det, impl_->rec, impl_->opt, image,
+                                           impl_->keep_gpu_constants);
+    auto out = impl_->RecognizeCrops(image, boxes, true, profile_e2e, classify, true);
+    if (!impl_->keep_gpu_constants) impl_->rec.ReleaseGpuConstants();
+    (void)(impl_->keep_gpu_constants ? impl_->rec.gpu_arena().ReclaimFreeTransientStorage()
+                                     : impl_->rec.gpu_arena().ReclaimFreeStorage());
+    gpu_lock.unlock();
+    ReclaimHostHeap();
+    return out;
+  }
+  if (impl_->opt.backend == Backend::gpu_only && !partial_on_cpu) {
+    auto result = RecognizeGpuOnly(impl_->det, impl_->rec, impl_->opt, impl_->dict, image,
+                                   impl_->keep_gpu_constants);
+    // Stable-service memory policy: all activations and temporary DB buffers
+    // have completed at this point; retain only immutable model slots.
+    if (impl_->reclaim_gpu_transient &&
+        !impl_->det.gpu_arena().ReclaimFreeTransientStorage()) {
+      Fail("GPU-only completed-request arena reclaim failed");
+    }
+    return result;
+  }
+  // Hybrid is intentionally best-effort and is allowed to retain the CPU
+  // route after a failed optional GPU segment.  Strict gpu_only above is not:
+  // it returns before this block and every Vulkan failure propagates to the
+  // caller without a CPU inference retry.
+  if (full && impl_->enable_hybrid_gpu_graph && !classify) {
+    int graph_state = 0;
+    {
+      std::lock_guard lock(impl_->hybrid_gpu_graph_mutex);
+      graph_state = impl_->hybrid_gpu_graph_state;
+    }
+    if (graph_state >= 0) {
+      try {
+        auto result = RecognizeGpuOnly(impl_->det, impl_->rec, impl_->opt, impl_->dict, image,
+                                       impl_->keep_gpu_constants);
+        {
+          std::lock_guard lock(impl_->hybrid_gpu_graph_mutex);
+          impl_->hybrid_gpu_graph_state = 1;
+        }
+        if (impl_->reclaim_gpu_transient) {
+          (void)impl_->det.gpu_arena().ReclaimFreeTransientStorage();
+        }
+        return result;
+      } catch (const std::exception& ex) {
+        std::lock_guard lock(impl_->hybrid_gpu_graph_mutex);
+        if (impl_->hybrid_gpu_graph_state != -1) {
+          std::fprintf(stderr,
+                       "ppocr: Vulkan graph unavailable (%s); falling back to CPU\n",
+                       ex.what());
+        }
+        impl_->hybrid_gpu_graph_state = -1;
+      }
+    }
+  }
+  // The detector probability map can be several MiB for a large page. It is
+  // needed only while DB post-processing constructs independent Box values;
+  // keep the detector workspace scoped so it is released before bounded,
+  // concurrent recognizer batches begin. This lets the allocator reuse that
+  // storage for recognition activations instead of increasing peak memory.
+  const bool profile_e2e = std::getenv("PPOCR_PROFILE_E2E") != nullptr;
+  const auto boxes = !use_det ? std::vector<Box>{[&] {
+    // rapidocr 3.x use_det=False: the whole image is one text line.
+    Box whole;
+    const float w = float(image.width), h = float(image.height);
+    whole.p = {Point{0.F, 0.F}, Point{w, 0.F}, Point{w, h}, Point{0.F, h}};
+    whole.score = 1.F;
+    return whole;
+  }()} : [&] {
+    const auto t0 = profile_e2e ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+    std::unordered_map<std::string,Tensor> det_input;
+    Tensor det_tensor;
+    Tensor stem_tensor;
+    std::string stem_output_name;
+    std::array<std::string, 3> skipped_stem{};
+    Tensor conv2_tensor;
+    std::array<std::string, 3> conv012_names{};
+    // Both front ends include their own numerical and complete-boundary
+    // timing admission.  Let that measured policy decide by default instead
+    // of requiring an opt-in switch; a slower or imprecise GPU route remains
+    // on the SIMD CPU path.
+    const bool try_gpu_stem = std::getenv("PPOCR_DISABLE_VULKAN_RGB_STEM") == nullptr;
+    const bool disable_conv012 = std::getenv("PPOCR_DISABLE_VULKAN_RGB_CONV012") != nullptr;
+    auto seed_cpu_stem = [&] {
+      det_input.emplace(std::move(stem_output_name), std::move(stem_tensor));
+      det_input.emplace("x", Tensor{{1}, {0.F}});
+      for (const auto& name : skipped_stem) {
+        if (!name.empty()) det_input.emplace(name, Tensor{{1}, {0.F}});
+      }
+    };
+    bool seeded = false;
+    if (try_gpu_stem && TryHybridVulkanDetRgbStem(image, impl_->opt, impl_->det, stem_tensor,
+                                                   stem_output_name, skipped_stem)) {
+      seed_cpu_stem();
+      seeded = true;
+    }
+    if (!seeded) {
+      // GPU RGB-upload then CPU stem paid a D2H of 3x160x704 before the fused
+      // AVX-512 walk. CPU DetInput plus fused stem is the winning hybrid path.
+      det_tensor = DetInput(image, impl_->opt);
+      if (TryCpuDetRgbStem(det_tensor, impl_->det, stem_tensor, stem_output_name,
+                           skipped_stem)) {
+        seed_cpu_stem();
+        seeded = true;
+      }
+    }
+    if (!seeded && !disable_conv012 &&
+        TryHybridVulkanDetRgbConv012(image, impl_->opt, impl_->det, stem_tensor, conv2_tensor,
+                                     conv012_names)) {
+      det_input.emplace(conv012_names[0], std::move(stem_tensor));
+      if (!conv012_names[1].empty()) det_input.emplace(conv012_names[1], Tensor{{1}, {0.F}});
+      det_input.emplace(conv012_names[2], std::move(conv2_tensor));
+      det_input.emplace("x", Tensor{{1}, {0.F}});
+      seeded = true;
+    }
+    if (!seeded && TryHybridVulkanDetRgbConv0(image, impl_->opt, impl_->det, stem_tensor,
+                                              stem_output_name)) {
+      det_input.emplace(std::move(stem_output_name), std::move(stem_tensor));
+      det_input.emplace("x", Tensor{{1}, {0.F}});
+      seeded = true;
+    }
+    if (!seeded) det_input.emplace("x", std::move(det_tensor));
+    const auto t1 = profile_e2e ? std::chrono::steady_clock::now() : t0;
+    auto detector_output=impl_->det.Run(std::move(det_input));
+    const Tensor* prob=nullptr;
+    for(const auto&[_,t]:detector_output) {
+      if(t.shape.size()==4&&t.shape[1]==1) { prob=&t; break; }
+    }
+    if(!prob) Fail("detector probability map not found");
+    const auto t2 = profile_e2e ? std::chrono::steady_clock::now() : t0;
+    auto boxes_out = DBPost(*prob,image.width,image.height,impl_->opt);
+    if (profile_e2e) {
+      const auto t3 = std::chrono::steady_clock::now();
+      std::cerr << "e2e_ms det_pre="
+                << std::chrono::duration<double, std::milli>(t1 - t0).count()
+                << " det_run="
+                << std::chrono::duration<double, std::milli>(t2 - t1).count()
+                << " db="
+                << std::chrono::duration<double, std::milli>(t3 - t2).count()
+                << '\n';
+    }
+    return boxes_out;
+  }();
+  if (!use_rec) {
+    std::vector<Result> detected;
+    detected.reserve(boxes.size());
+    for (const auto& box : boxes) detected.push_back(MakeResult(box, std::string{}, box.score));
+    if (classify && !boxes.empty()) {
+      std::vector<CropImage> crops(boxes.size());
+      RunIndexed(boxes.size(),
+                 static_cast<std::size_t>(std::max(1, impl_->opt.batch_preprocess_parallelism)),
+                 [&](std::size_t i) {
+        float pts[8];
+        for (int k = 0; k < 4; ++k) {
+          pts[2 * k] = boxes[i].p[static_cast<std::size_t>(k)].x;
+          pts[2 * k + 1] = boxes[i].p[static_cast<std::size_t>(k)].y;
+        }
+        detail::cvc::RotateCropImage(image.rgb.data(), image.width, image.height, pts,
+                                     crops[i].rgb, crops[i].w, crops[i].h);
+      });
+      std::vector<ClsOutcome> orientation;
+      ClassifyCrops(impl_->cls, impl_->opt, crops, orientation);
+      for (std::size_t i = 0; i < detected.size(); ++i) {
+        detected[i].cls_label = orientation[i].label;
+        detected[i].cls_score = orientation[i].score;
+        detected[i].rotated_180 = orientation[i].rotated;
+      }
+    }
+    ReclaimHostHeap();
+    return detected;
+  }
+  auto out = impl_->RecognizeCrops(image, boxes, use_det, profile_e2e, classify);
+  ReclaimHostHeap();
+  return out;
+}
+
+std::vector<std::vector<Result>> OCR::RecognizeBatch(
+    const std::vector<Image>& images) const {
+  std::vector<std::vector<Result>> output(images.size());
+  if (images.empty()) return output;
+  if (impl_->lite) {
+    for (std::size_t i = 0; i < images.size(); ++i) output[i] = Run(images[i], true, true);
+    return output;
+  }
+  // Metal / Vulkan GPU-only: the same exact front end as Run (see DetectGpuExactInput), page by page.
+  if (impl_->opt.backend == Backend::gpu_only &&
+      (impl_->metal ? !MetalDeviceFrontEnd() : !VulkanDeviceFrontEnd())) {
+    for (std::size_t i = 0; i < images.size(); ++i) output[i] = Run(images[i], true, true);
+    return output;
+  }
+  std::lock_guard lock(impl_->recognize_mutex);
+  detail::kernels::FloatModeGuard float_mode;
+  std::unique_lock<std::recursive_mutex> gpu_lock(SharedGpuMutex(), std::defer_lock);
+  if (impl_->opt.backend != Backend::cpu_only) gpu_lock.lock();
+  // The GPU-only path retains image/crop tensors on its one Vulkan queue. A
+  // Same-original-size pages are coalesced for one device-side RGB front end
+  // + detector graph. Their same-width recognizer crops are then coalesced
+  // into real NCHW attention batches, without relaxing GPU-only's contract.
+  if (impl_->opt.backend == Backend::gpu_only) {
+    for (const auto& image : images) if (image.empty()) Fail("invalid RGB image");
+    struct Bucket { int source_width{}, source_height{}, width{}, height{}; std::vector<std::size_t> pages; };
+    // Hash all four signed geometry fields without truncating detector
+    // dimensions. The prior shift/XOR packing overlapped high width bits with
+    // source-height bits, which could coalesce unrelated pages on large input
+    // sets. A typed key keeps GPU batching exact and fail-closed.
+    struct BatchKey {
+      int source_width, source_height, detector_width, detector_height;
+      bool operator==(const BatchKey&) const noexcept = default;
+    };
+    struct BatchKeyHash {
+      std::size_t operator()(const BatchKey& value) const noexcept {
+        std::size_t hash = 1469598103934665603ull;
+        for (const int field : {value.source_width, value.source_height,
+                                value.detector_width, value.detector_height}) {
+          hash ^= static_cast<std::uint32_t>(field);
+          hash *= 1099511628211ull;
+        }
+        return hash;
+      }
+    };
+    std::unordered_map<BatchKey, Bucket, BatchKeyHash> buckets;
+    for (std::size_t page = 0; page < images.size(); ++page) {
+      const auto [width, height] = DetInputSize(images[page], impl_->opt);
+      const auto& image = images[page];
+      const BatchKey key{image.width, image.height, width, height};
+      auto& bucket = buckets[key];
+      bucket.source_width = image.width; bucket.source_height = image.height;
+      bucket.width = width; bucket.height = height; bucket.pages.push_back(page);
+    }
+  // Medium detector's 896-channel Vulkan tail is presently qualified only
+  // for N=1 on the Radeon/LLPC driver. Keep the requested detector batch
+  // for models/drivers that can execute it; when a batched graph is rejected,
+  // rerun each page as an independent strict GPU-only graph. This is a GPU
+  // scheduling retry after the runtime recovery boundary, never a CPU path.
+    const std::size_t cap = static_cast<std::size_t>(std::max(1, impl_->opt.det_batch_size));
+    for (auto& [bucket_key, bucket] : buckets) {
+      for (std::size_t first = 0; first < bucket.pages.size(); first += cap) {
+        const std::vector<std::size_t> pages(bucket.pages.begin() + first,
+                                             bucket.pages.begin() + std::min(bucket.pages.size(), first + cap));
+        std::vector<std::vector<Box>> boxes;
+        const std::string batch_key = std::to_string(bucket.source_width) + 'x' +
+            std::to_string(bucket.source_height) + ':' + std::to_string(bucket.width) + 'x' +
+            std::to_string(bucket.height) + ':' + std::to_string(pages.size());
+        const auto serial_gpu_only = [&] {
+          // Strict GPU-only failure has no CPU fallback. Retry independent
+          // GPU pages after the runtime's device-loss recovery boundary.
+          for (const std::size_t page : pages) output[page] = Recognize(images[page]);
+        };
+        if (pages.size() == 1) {
+          serial_gpu_only();
+          continue;
+        }
+        {
+          std::lock_guard lock(impl_->gpu_batch_rejection_mutex);
+          if (impl_->gpu_batch_rejections.contains(batch_key)) {
+            serial_gpu_only();
+            continue;
+          }
+        }
+        try {
+          boxes = DetectGpuOnlyBatch(impl_->det, impl_->rec, impl_->opt, images, pages,
+                                     bucket.width, bucket.height, impl_->keep_gpu_constants);
+        } catch (const std::exception&) {
+          // Cache only this exact source/detector/N shape; another shape may
+          // be valid on the same adapter. No batch exception is hidden: it is
+          // handled only by the documented strict N=1 GPU-only recovery path.
+          {
+            std::lock_guard lock(impl_->gpu_batch_rejection_mutex);
+            impl_->gpu_batch_rejections.insert(batch_key);
+          }
+          serial_gpu_only();
+          continue;
+        }
+        for (std::size_t item = 0; item < pages.size(); ++item) {
+          output[pages[item]].resize(boxes[item].size());
+        }
+        std::map<int, std::vector<GpuCropJob>> rec_buckets;
+        for (std::size_t item = 0; item < pages.size(); ++item) {
+          const std::size_t page = pages[item];
+          for (std::size_t index = 0; index < boxes[item].size(); ++index) {
+            const auto crop = CropBoundsFor(images[page], boxes[item][index]);
+            rec_buckets[GpuRecognitionWidth(crop, impl_->opt)].push_back(
+                {page, index, &images[page], &boxes[item][index], crop});
+          }
+        }
+        const std::size_t rec_cap = static_cast<std::size_t>(std::max(1, impl_->opt.rec_batch_size));
+        for (auto& [rec_width, jobs] : rec_buckets) {
+          for (std::size_t rec_first = 0; rec_first < jobs.size(); rec_first += rec_cap) {
+            const std::vector<GpuCropJob> batch(jobs.begin() + rec_first,
+                                                jobs.begin() + std::min(jobs.size(), rec_first + rec_cap));
+            RecognizeGpuOnlyCropBatch(impl_->rec, impl_->opt, impl_->dict, batch, output,
+                                      nullptr);
+          }
+        }
+      }
+    }
+    if (impl_->reclaim_gpu_transient &&
+        !impl_->det.gpu_arena().ReclaimFreeTransientStorage()) {
+      Fail("GPU-only completed-batch arena reclaim failed");
+    }
+    return output;
+  }
+
+  // Detector pages have independent dynamic resize shapes.  Do not pad them
+  // into one artificial batch: it wastes feature-map work and changes the
+  // model's intended resize behavior.  Instead detect pages independently,
+  // then coalesce the resulting same-width recognition crops across all
+  // pages.  The latter is a *real* NCHW batch, not merely a page scheduler;
+  // it feeds Vulkan's Y batch dimension and lets CPU pointwise/MatMul paths
+  // amortize executor overhead over crops from multiple source images.
+  for (const auto& image : images) {
+    if (image.empty()) Fail("invalid RGB image");
+  }
+  if (impl_->det.outputs().empty()) Fail("detector has no output");
+  std::vector<std::vector<Box>> page_boxes(images.size());
+  // `image_batch_parallelism` is useful CPU-side concurrency, but it is not
+  // device concurrency.  Hybrid has one synchronous Vulkan queue/context;
+  // letting several detector graphs race to that queue only serializes their
+  // GPU segments while keeping several large detector activation frontiers
+  // alive.  Match recognition's queue-aware policy here: CPU may retain the
+  // requested page parallelism, while hybrid defaults to one graph submitter
+  // unless the caller has explicitly measured a driver-specific override.
+  const auto requested_detector_parallelism = impl_->opt.backend == Backend::hybrid
+      ? impl_->opt.hybrid_graph_parallelism : impl_->opt.image_batch_parallelism;
+  const auto workers = std::min<std::size_t>(
+      images.size(), std::max(1, requested_detector_parallelism));
+  const auto run_indexed = [&](std::size_t item_count, std::size_t thread_count,
+                               const auto& run_one) {
+    RunIndexed(item_count, thread_count, run_one);
+  };
+  // Group only exactly equal detector resize dimensions. This produces a
+  // genuine NCHW detector batch without padding any page or perturbing the
+  // model's dynamic resize behavior. It benefits CPU batch kernels today and
+  // maps naturally to Vulkan's batch Y dimension as more device-resident
+  // detector segments are added.
+  struct DetectorBucket { int width, height; std::vector<std::size_t> pages; };
+  std::unordered_map<std::uint64_t, DetectorBucket> detector_buckets;
+  for (std::size_t page = 0; page < images.size(); ++page) {
+    const auto [width, height] = DetInputSize(images[page], impl_->opt);
+    const auto key = (static_cast<std::uint64_t>(static_cast<std::uint32_t>(height)) << 32) |
+                     static_cast<std::uint32_t>(width);
+    auto& bucket = detector_buckets[key];
+    bucket.width = width;
+    bucket.height = height;
+    bucket.pages.push_back(page);
+  }
+  // The Vulkan executor receives the leading N dimension directly for every
+  // implemented primitive.  Keep same-shape detector pages together for
+  // hybrid too: each individual GPU segment still has its own complete
+  // H2D + dispatch + fence + D2H no-slower admission, so enlarging a batch
+  // cannot silently force a slower GPU route.  This also lets an admitted
+  // segment amortize one queue submission across multiple independent pages.
+  const auto detector_batch_size =
+      static_cast<std::size_t>(std::max(1, impl_->opt.det_batch_size));
+  const auto batch_preprocess_parallelism = static_cast<std::size_t>(
+      std::max(1, impl_->opt.batch_preprocess_parallelism));
+  // `detect_batch` can itself run concurrently for separate dynamic shapes.
+  // Divide the front-end resize budget between those graph workers so opting
+  // into page-level parallelism does not accidentally multiply thread count.
+  const auto preprocess_workers_per_detector_batch = std::max<std::size_t>(
+      1, batch_preprocess_parallelism / std::max<std::size_t>(1, workers));
+  struct DetectorBatch { int width, height; const std::size_t* pages; std::size_t count; };
+  std::vector<DetectorBatch> detector_batches;
+  for (auto& [_, bucket] : detector_buckets) {
+    for (std::size_t first = 0; first < bucket.pages.size(); first += detector_batch_size) {
+      detector_batches.push_back({bucket.width, bucket.height, bucket.pages.data() + first,
+                                  std::min(detector_batch_size, bucket.pages.size() - first)});
+    }
+  }
+  const auto detect_batch = [&](std::size_t batch_index) {
+    const auto& batch = detector_batches[batch_index];
+    Tensor input{{static_cast<std::int64_t>(batch.count), 3, batch.height, batch.width},
+                 std::vector<float>(batch.count * std::size_t(3) * batch.height * batch.width)};
+    const auto stride = std::size_t(3) * batch.height * batch.width;
+    // There is only one detector graph dispatch for a same-shape NCHW
+    // batch.  Parallelize the independent resizes before it; otherwise the
+    // GPU (and the CPU's SIMD batch kernels) wait for a serial front end on
+    // the common N=4 page case.  Each task owns an entire contiguous NCHW
+    // image plane, so this needs no synchronization beyond run_indexed.
+    run_indexed(batch.count,
+                std::min(batch.count, preprocess_workers_per_detector_batch),
+                [&](std::size_t item) {
+      const auto page = batch.pages[item];
+      WriteDetInput(input.data.data() + item * stride, images[page], batch.width, batch.height,
+                    impl_->opt);
+    });
+    std::unordered_map<std::string, Tensor> det_input;
+    det_input.emplace("x", std::move(input));
+    auto detector_output = impl_->det.Run(std::move(det_input));
+    const Tensor* probability = nullptr;
+    for (const auto& [_, tensor] : detector_output) {
+      if (tensor.shape.size() == 4 && tensor.shape[0] == static_cast<std::int64_t>(batch.count) &&
+          tensor.shape[1] == 1) {
+        probability = &tensor;
+        break;
+      }
+    }
+    if (!probability) Fail("detector probability map not found");
+    for (std::size_t item = 0; item < batch.count; ++item) {
+      const auto page = batch.pages[item];
+      page_boxes[page] = DBPost(*probability, images[page].width, images[page].height,
+                                impl_->opt, item);
+    }
+  };
+  run_indexed(detector_batches.size(), workers, detect_batch);
+
+  // Recognition follows Recognize() page by page (rapidocr 3.10 batching is
+  // per page), so every nested result equals the standalone call.
+  for (std::size_t page = 0; page < images.size(); ++page) {
+    output[page] = impl_->RecognizeCrops(images[page], page_boxes[page], true, false,
+                                         impl_->cls_default);
+  }
+  ReclaimHostHeap();
+  return output;
+}
+
+Image LoadPPM(const std::string& path) { std::ifstream f(path,std::ios::binary);if(!f)Fail("cannot open image "+path);std::string magic;f>>magic;if(magic!="P6")Fail("only binary P6 PPM is supported");auto token=[&](){std::string s;while(f>>s&&s.starts_with('#'))std::getline(f,s);return s;};int w=std::stoi(token()),h=std::stoi(token()),max=std::stoi(token());if(w<=0||h<=0||max!=255)Fail("invalid PPM header");f.get();Image out{w,h,std::vector<std::uint8_t>(std::size_t(w)*h*3)};f.read(reinterpret_cast<char*>(out.rgb.data()),std::streamsize(out.rgb.size()));if(f.gcount()!=std::streamsize(out.rgb.size()))Fail("truncated PPM pixels");return out; }
+}  // namespace rpocr

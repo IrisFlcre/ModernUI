@@ -1,0 +1,603 @@
+cmake_minimum_required(VERSION 3.20)
+project(ppocr_cpp VERSION 5.0.0 LANGUAGES C CXX)
+
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+option(PPOCR_BUILD_SHARED "Build the shared library" ON)
+option(PPOCR_BUILD_STATIC "Build the static library" ON)
+option(PPOCR_BUILD_EXAMPLES "Build examples and smoke tools" ON)
+option(PPOCR_BUILD_TESTS "Build the C API smoke test" ON)
+# Shaders are compiled into the library. The loader is dlopen'd, so this does
+# not add a libvulkan DT_NEEDED entry. Wheels pass OFF: manylinux images do
+# not ship glslang, and the published CPU wheel must not change when the
+# image happens to contain a shader compiler.
+option(PPOCR_ENABLE_VULKAN "Embed Vulkan compute shaders when headers and glslangValidator are available" ON)
+# Native Metal execution of the same GPU graph on Apple platforms. The GLSL
+# kernels are compiled to SPIR-V by glslang and translated to MSL by
+# SPIRV-Cross at build time; Metal compiles them at runtime. It needs
+# third_party/Vulkan-Headers, glslangValidator and spirv-cross on the build
+# machine and adds no runtime dependency beyond Metal.framework.
+if(APPLE)
+  set(PPOCR_METAL_DEFAULT ON)
+else()
+  set(PPOCR_METAL_DEFAULT OFF)
+endif()
+option(PPOCR_ENABLE_METAL "Build the native Metal GPU backend (Apple only)" ${PPOCR_METAL_DEFAULT})
+
+if(NOT PPOCR_BUILD_SHARED AND NOT PPOCR_BUILD_STATIC)
+  message(FATAL_ERROR "Enable PPOCR_BUILD_SHARED and/or PPOCR_BUILD_STATIC")
+endif()
+
+set(PPOCR_SOURCES
+    src/kernels.cpp
+    src/onnx_lite.cpp
+    src/ppocr.cpp
+    src/vulkan_backend.cpp
+    src/ppocr_c_api.cpp
+    src/db_geometry.cpp
+    src/cv_compat.cpp
+    src/clipper/clipper.cpp
+    src/np_argsort.cpp
+    src/word_boxes.cpp
+)
+
+add_library(ppocr_objects OBJECT ${PPOCR_SOURCES})
+set_target_properties(ppocr_objects PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+target_compile_definitions(ppocr_objects PRIVATE RPOCR_BUILDING_SHARED)
+target_include_directories(ppocr_objects PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_features(ppocr_objects PUBLIC cxx_std_20)
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include/vulkan/vulkan.h")
+  target_include_directories(ppocr_objects PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_VULKAN_HEADERS=1)
+endif()
+# The vendored glslang.exe is a Windows compiler. On Linux/ARM use a host
+# glslangValidator so the build does not try to execute a PE binary.
+if(WIN32 AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glslang/bin/glslang.exe")
+  set(PPOCR_GLSLANG "${CMAKE_CURRENT_SOURCE_DIR}/third_party/glslang/bin/glslang.exe")
+else()
+  find_program(PPOCR_GLSLANG NAMES glslangValidator glslang)
+endif()
+option(PPOCR_REQUIRE_METAL "Fail configure when the Metal backend cannot be built" OFF)
+set(PPOCR_METAL_ACTIVE OFF)
+if(PPOCR_ENABLE_METAL AND APPLE)
+  find_program(PPOCR_SPIRV_CROSS NAMES spirv-cross)
+  if(PPOCR_SPIRV_CROSS AND PPOCR_GLSLANG AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include/vulkan/vulkan.h")
+    set(PPOCR_METAL_ACTIVE ON)
+  else()
+    message(STATUS "Metal backend disabled: need Vulkan-Headers, glslangValidator and spirv-cross (glslang='${PPOCR_GLSLANG}' spirv-cross='${PPOCR_SPIRV_CROSS}')")
+    if(PPOCR_REQUIRE_METAL)
+      message(FATAL_ERROR "PPOCR_REQUIRE_METAL is ON but the Metal backend cannot be built")
+    endif()
+  endif()
+elseif(PPOCR_ENABLE_METAL)
+  message(STATUS "Metal backend is only built on Apple platforms")
+endif()
+if((PPOCR_ENABLE_VULKAN OR PPOCR_METAL_ACTIVE) AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include/vulkan/vulkan.h" AND PPOCR_GLSLANG)
+  set(PPOCR_VULKAN_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  set(PPOCR_VULKAN_SPV "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_binary.spv")
+  set(PPOCR_VULKAN_SPV_HEADER "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_binary_spv.hpp")
+  set(PPOCR_VULKAN_TAIL_SPV "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_depthwise_tail.spv")
+  set(PPOCR_VULKAN_TAIL_SPV_HEADER "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_depthwise_tail_spv.hpp")
+  set(PPOCR_VULKAN_POINTWISE_TAIL_SPV "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_pointwise_tail.spv")
+  set(PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_pointwise_tail_spv.hpp")
+  add_custom_command(
+    OUTPUT "${PPOCR_VULKAN_SPV}" "${PPOCR_VULKAN_SPV_HEADER}" "${PPOCR_VULKAN_TAIL_SPV}" "${PPOCR_VULKAN_TAIL_SPV_HEADER}" "${PPOCR_VULKAN_POINTWISE_TAIL_SPV}" "${PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${PPOCR_VULKAN_GENERATED_DIR}"
+    COMMAND "${PPOCR_GLSLANG}" -V -S comp -o "${PPOCR_VULKAN_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_binary.comp"
+    COMMAND "${PPOCR_GLSLANG}" -V -S comp -o "${PPOCR_VULKAN_TAIL_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_depthwise_tail.comp"
+    COMMAND "${PPOCR_GLSLANG}" -V -S comp -o "${PPOCR_VULKAN_POINTWISE_TAIL_SPV}" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_pointwise_tail.comp"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${PPOCR_VULKAN_SPV} -DOUTPUT=${PPOCR_VULKAN_SPV_HEADER} -DNAME=kVulkanBinarySpv -P "${CMAKE_CURRENT_SOURCE_DIR}/src/embed_spirv.cmake"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${PPOCR_VULKAN_TAIL_SPV} -DOUTPUT=${PPOCR_VULKAN_TAIL_SPV_HEADER} -DNAME=kVulkanDepthwiseTailSpv -P "${CMAKE_CURRENT_SOURCE_DIR}/src/embed_spirv.cmake"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${PPOCR_VULKAN_POINTWISE_TAIL_SPV} -DOUTPUT=${PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER} -DNAME=kVulkanPointwiseTailSpv -P "${CMAKE_CURRENT_SOURCE_DIR}/src/embed_spirv.cmake"
+    COMMAND ${CMAKE_COMMAND} -E touch "${PPOCR_VULKAN_SPV_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${PPOCR_VULKAN_TAIL_SPV_HEADER}"
+    COMMAND ${CMAKE_COMMAND} -E touch "${PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_binary.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_depthwise_tail.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/vulkan_pointwise_tail.comp" "${CMAKE_CURRENT_SOURCE_DIR}/src/embed_spirv.cmake" "${PPOCR_GLSLANG}"
+    VERBATIM)
+  add_custom_target(ppocr_vulkan_shader DEPENDS "${PPOCR_VULKAN_SPV_HEADER}" "${PPOCR_VULKAN_TAIL_SPV_HEADER}" "${PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER}")
+  add_dependencies(ppocr_objects ppocr_vulkan_shader)
+  target_include_directories(ppocr_objects PRIVATE "${PPOCR_VULKAN_GENERATED_DIR}")
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_VULKAN_KERNELS=1)
+  if(PPOCR_ENABLE_VULKAN)
+    target_compile_definitions(ppocr_objects PRIVATE PPOCR_VULKAN_LOADER=1)
+  endif()
+  if(PPOCR_METAL_ACTIVE)
+    enable_language(OBJCXX)
+    set(PPOCR_METAL_SOURCES "")
+    foreach(shader binary depthwise_tail pointwise_tail)
+      if(shader STREQUAL "binary")
+        set(name kMetalBinaryMsl)
+      elseif(shader STREQUAL "depthwise_tail")
+        set(name kMetalDepthwiseTailMsl)
+      else()
+        set(name kMetalPointwiseTailMsl)
+      endif()
+      set(raw "${PPOCR_VULKAN_GENERATED_DIR}/metal_${shader}.raw.metal")
+      set(msl "${PPOCR_VULKAN_GENERATED_DIR}/metal_${shader}.metal")
+      set(header "${PPOCR_VULKAN_GENERATED_DIR}/metal_${shader}_msl.hpp")
+      add_custom_command(
+        OUTPUT "${header}"
+        COMMAND "${PPOCR_SPIRV_CROSS}" --msl --msl-version 20400 --msl-decoration-binding
+                --output "${raw}" "${PPOCR_VULKAN_GENERATED_DIR}/vulkan_${shader}.spv"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${raw} -DOUTPUT=${msl} -P "${CMAKE_CURRENT_SOURCE_DIR}/src/metal_patch_msl.cmake"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${msl} -DOUTPUT=${header} -DNAME=${name} -P "${CMAKE_CURRENT_SOURCE_DIR}/src/embed_spirv.cmake"
+        DEPENDS "${PPOCR_VULKAN_SPV_HEADER}" "${PPOCR_VULKAN_TAIL_SPV_HEADER}" "${PPOCR_VULKAN_POINTWISE_TAIL_SPV_HEADER}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/src/metal_patch_msl.cmake" "${PPOCR_SPIRV_CROSS}"
+        VERBATIM)
+      list(APPEND PPOCR_METAL_SOURCES "${header}")
+    endforeach()
+    add_custom_target(ppocr_metal_shader DEPENDS ${PPOCR_METAL_SOURCES})
+    add_dependencies(ppocr_metal_shader ppocr_vulkan_shader)
+    add_dependencies(ppocr_objects ppocr_metal_shader)
+    target_sources(ppocr_objects PRIVATE src/metal_driver.mm)
+    set_source_files_properties(src/metal_driver.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-fno-fast-math")
+    target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_METAL=1)
+    set(PPOCR_METAL_LINK "-framework Metal" "-framework Foundation")
+    message(STATUS "Metal backend enabled (${PPOCR_SPIRV_CROSS})")
+  endif()
+elseif(NOT PPOCR_ENABLE_VULKAN)
+  message(STATUS "Vulkan compute shaders disabled by PPOCR_ENABLE_VULKAN=OFF")
+else()
+  message(STATUS "Vulkan compute shaders disabled: need Vulkan-Headers and glslangValidator")
+endif()
+
+if(MSVC)
+  target_compile_options(ppocr_objects PRIVATE /W4 /permissive- /O2 /fp:fast)
+else()
+  target_compile_options(ppocr_objects PRIVATE -Wall -Wextra -Wpedantic -O3 -ffast-math -funroll-loops
+      -U__FINITE_MATH_ONLY__ -D__FINITE_MATH_ONLY__=0)
+  # -ffast-math defines __FINITE_MATH_ONLY__=1, and old glibc headers
+  # (manylinux2014, glibc 2.17) then redirect expf/powf/hypot to __*_finite.
+  # glibc >= 2.31 no longer lets new programs link those, so librapidocrlite.a was
+  # unusable on current distros. Resetting only the macro keeps the fast-math
+  # code generation (bit-identical results) and calls the plain functions;
+  # -fno-finite-math-only would also change codegen and score bits.
+endif()
+
+string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR};${CMAKE_GENERATOR_PLATFORM}" PPOCR_CPU)
+if(NOT MSVC AND PPOCR_CPU MATCHES "x86_64|amd64|x64|i[3-6]86")
+  # Baseline translation units stay SSE2. Auto-vectorization must not emit
+  # AVX or AVX-512, or an AVX2-only machine will SIGILL inside the fallback.
+  set_source_files_properties(
+      src/kernels.cpp src/onnx_lite.cpp src/ppocr.cpp src/vulkan_backend.cpp src/ppocr_c_api.cpp
+      PROPERTIES COMPILE_OPTIONS "-mno-avx;-mno-avx2;-mno-avx512f")
+endif()
+
+# DB postprocess geometry and the OpenCV crop/resize port (cv_compat)
+# reproduce OpenCV/pyclipper float results bit for bit, so these files opt
+# out of fast-math and FMA contraction.
+if(MSVC)
+  set_source_files_properties(src/db_geometry.cpp src/cv_compat.cpp
+      PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set_source_files_properties(src/clipper/clipper.cpp
+      PROPERTIES COMPILE_OPTIONS "/fp:precise;/w")
+else()
+  # FMA contraction follows the compiler default OpenCV wheels are built
+  # with: none on baseline x86, "on" for Clang (Apple arm64), "fast" for GCC.
+  if(PPOCR_CPU MATCHES "x86_64|amd64|x64|i[3-6]86")
+    set(PPOCR_STRICT_FP "-fno-fast-math;-ffp-contract=off;-mno-avx;-mno-avx2;-mno-avx512f")
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(PPOCR_STRICT_FP "-fno-fast-math;-ffp-contract=on")
+  else()
+    set(PPOCR_STRICT_FP "-fno-fast-math;-ffp-contract=fast")
+  endif()
+  set_source_files_properties(src/db_geometry.cpp src/cv_compat.cpp
+      PROPERTIES COMPILE_OPTIONS "${PPOCR_STRICT_FP}")
+  # Vendored Clipper 6.4.2 is kept verbatim; silence its old-style warnings.
+  set_source_files_properties(src/clipper/clipper.cpp
+      PROPERTIES COMPILE_OPTIONS "${PPOCR_STRICT_FP};-w")
+endif()
+
+# AVX2 is isolated in its own object file. kernels.cpp remains baseline x86,
+# so CPUs without AVX/AVX2 can safely take its scalar fallback at runtime.
+if(PPOCR_CPU MATCHES "loongarch64" AND NOT MSVC)
+  # LSX is the la64v1.0 baseline (NEON code paths via src/neon_lsx_shim.hpp);
+  # LASX kernels live in their own TU and are entered after a HWCAP check.
+  target_sources(ppocr_objects PRIVATE src/kernels_lasx.cpp)
+  set_source_files_properties(src/kernels_lasx.cpp PROPERTIES COMPILE_OPTIONS "-mlasx")
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_LASX_KERNELS=1)
+endif()
+if(PPOCR_CPU MATCHES "x86_64|amd64|x64|i[3-6]86")
+  target_sources(ppocr_objects PRIVATE src/kernels_avx2.cpp src/cv_compat_avx2.cpp)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_AVX2_KERNELS=1)
+  if(MSVC)
+    set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:fast")
+    set_source_files_properties(src/cv_compat_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+  else()
+    # OpenCV's AVX2 bicubic kernel, rounding step for rounding step.
+    set_source_files_properties(src/cv_compat_avx2.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx2;-mfma;-mno-avx512f;-fno-fast-math;-ffp-contract=off")
+    # -mno-avx512* is last-wins together with -mavx2 and forbids the compiler
+    # from rewriting this file with EVEX/zmm encodings.
+    set_source_files_properties(src/kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx2;-mfma;-mno-avx512f;-mno-avx512bw;-mno-avx512vl;-mno-avx512dq")
+  endif()
+  # 32-bit MSVC builds compile the AVX-512 kernels but they produce wrong
+  # results there (truncated recognition), so x86 (win32) keeps AVX2 + scalar.
+  if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    message(STATUS "AVX-512 kernels disabled for this 32-bit build")
+  else()
+  target_sources(ppocr_objects PRIVATE src/kernels_avx512.cpp)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_AVX512_KERNELS=1)
+  endif()
+  if(MSVC)
+    set_source_files_properties(src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:fast")
+  else()
+    # This TU uses AVX-512F/DQ/BW/VL plus BMI tzcnt. None of those encodings
+    # are enabled in kernels.cpp or kernels_avx2.cpp. HasAvx512() requires
+    # the same feature bits before the TU is entered.
+    set_source_files_properties(src/kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx512f;-mavx512dq;-mavx512bw;-mavx512vl;-mbmi;-mbmi2;-mfma")
+  endif()
+endif()
+
+# np.argsort order for recognition batches (src/np_argsort.hpp): NumPy's
+# scalar introsort everywhere, plus the vendored x86-simd-sort argsort built
+# for NumPy's X86_V3 (AVX2) and X86_V4 (AVX-512) dispatch targets on x86.
+# No fast-math: NaN placement must follow NumPy.
+if(MSVC)
+  set_source_files_properties(src/np_argsort.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  set_source_files_properties(src/word_boxes.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+else()
+  set_source_files_properties(src/np_argsort.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math")
+  # word boxes follow numpy / OpenCV arithmetic: no fused multiply-add.
+  set_source_files_properties(src/word_boxes.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+endif()
+if(PPOCR_CPU MATCHES "x86_64|amd64|x64|i[3-6]86")
+  target_sources(ppocr_objects PRIVATE src/np_argsort_avx2.cpp)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_NP_ARGSORT_AVX2=1)
+  set(PPOCR_NP_ARGSORT_SIMD src/np_argsort_avx2.cpp)
+  if(NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(ppocr_objects PRIVATE src/np_argsort_avx512.cpp)
+    target_compile_definitions(ppocr_objects PRIVATE PPOCR_HAS_NP_ARGSORT_AVX512=1)
+    list(APPEND PPOCR_NP_ARGSORT_SIMD src/np_argsort_avx512.cpp)
+  endif()
+  set_source_files_properties(${PPOCR_NP_ARGSORT_SIMD} PROPERTIES
+      INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/third_party/x86-simd-sort/src")
+  if(MSVC)
+    set_source_files_properties(src/np_argsort_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise;/W0")
+    set_source_files_properties(src/np_argsort_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise;/W0")
+  else()
+    set_source_files_properties(src/np_argsort_avx2.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx2;-mfma;-mf16c;-mbmi;-mbmi2;-mlzcnt;-mmovbe;-mpopcnt;-msse4.2;-mno-avx512f;-fno-fast-math;-w")
+    set_source_files_properties(src/np_argsort_avx512.cpp PROPERTIES COMPILE_OPTIONS
+        "-mavx512f;-mavx512cd;-mavx512vl;-mavx512bw;-mavx512dq;-mavx2;-mfma;-mf16c;-mbmi;-mbmi2;-mlzcnt;-mmovbe;-mpopcnt;-msse4.2;-fno-fast-math;-w")
+  endif()
+endif()
+
+# Native Indra OCR ("lite" model): ONNX reader, recognizer, ISA kernels (runtime dispatch).
+# Builds with GCC, Clang and MSVC (x86 / x64: AVX2 and AVX-512 kernels with runtime dispatch).
+set(PPOCR_INDRA_BASE_SOURCES src/indra/onnx_min.cpp src/indra/indra_rec.cpp src/indra/indra_det.cpp src/indra/indra_script.cpp
+    src/indra/indra_order.cpp src/indra/dispatch.cpp src/indra/indra_c_api.cpp src/indra/kern_scalar.cpp src/indra/cpu_x86.cpp)
+target_sources(ppocr_objects PRIVATE ${PPOCR_INDRA_BASE_SOURCES} src/indra/imgproc.cpp src/indra/lite_pipeline.cpp src/indra/int8_gemm.cpp)
+set(PPOCR_INDRA_X86 OFF)
+if(MSVC)
+  if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "^(x64|X86|x86)$")
+    set(PPOCR_INDRA_X86 ON)
+  endif()
+elseif(PPOCR_CPU MATCHES "x86_64|amd64|x64")
+  set(PPOCR_INDRA_X86 ON)
+endif()
+if(MSVC)
+  # IEEE arithmetic everywhere in the lite engine: /fp:precise without /fp:contract never fuses a * b + c
+  # (the FMA kernels issue explicit fused intrinsics instead), so results match the GCC/Clang builds.
+  set_source_files_properties(${PPOCR_INDRA_BASE_SOURCES} src/indra/imgproc.cpp src/indra/lite_pipeline.cpp
+      src/indra/int8_gemm.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+  if(PPOCR_INDRA_X86)
+    target_sources(ppocr_objects PRIVATE src/indra/kern_avx2.cpp src/indra/imgproc_avx2.cpp)
+    set_source_files_properties(src/indra/kern_avx2.cpp src/indra/imgproc_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2;/fp:precise")
+    target_compile_definitions(ppocr_objects PRIVATE PPOCR_INDRA_AVX2=1)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+      target_sources(ppocr_objects PRIVATE src/indra/kern_avx512.cpp)
+      set_source_files_properties(src/indra/kern_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512;/fp:precise")
+      target_compile_definitions(ppocr_objects PRIVATE PPOCR_INDRA_AVX512=1)
+    else()
+      message(STATUS "lite engine: 32-bit build keeps AVX2 + scalar kernels (no AVX-512)")
+    endif()
+  endif()
+else()
+# imgproc.cpp reproduces OpenCV's float rounding: every FMA is explicit, so no compiler contraction.
+  set_source_files_properties(src/indra/imgproc.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  # lite_pipeline.cpp reproduces numpy / Python float semantics: IEEE arithmetic, no fast-math, no contraction.
+  set_source_files_properties(src/indra/lite_pipeline.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
+endif()
+if(NOT MSVC AND PPOCR_CPU MATCHES "x86_64|amd64|x64")
+  set_source_files_properties(${PPOCR_INDRA_BASE_SOURCES}
+      PROPERTIES COMPILE_OPTIONS "-mno-avx;-mno-avx2;-mno-avx512f;-ffp-contract=off")
+  target_sources(ppocr_objects PRIVATE src/indra/kern_avx2.cpp src/indra/kern_avx512.cpp src/indra/imgproc_avx2.cpp)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_INDRA_AVX2=1 PPOCR_INDRA_AVX512=1)
+  set_source_files_properties(src/indra/imgproc_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-ffp-contract=off")
+  set_source_files_properties(src/indra/kern_avx2.cpp PROPERTIES COMPILE_OPTIONS
+      "-mavx2;-mfma;-mno-avx512f;-mno-avx512bw;-mno-avx512vl;-mno-avx512dq;-ffp-contract=off")
+  set_source_files_properties(src/indra/kern_avx512.cpp PROPERTIES COMPILE_OPTIONS
+      "-mavx512f;-mavx512dq;-mavx512bw;-mavx512vl;-mfma;-ffp-contract=off")
+elseif(PPOCR_CPU MATCHES "aarch64|arm64")
+  target_sources(ppocr_objects PRIVATE src/indra/kern_neon.cpp)
+if(APPLE)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_INDRA_ACCELERATE)
+  option(PPOCR_INDRA_METAL "Indra lite recognizer: optional Metal GPU CTC head (runtime opt-in PPOCR_INDRA_METAL=1)" ON)
+  if(PPOCR_INDRA_METAL)
+    enable_language(OBJCXX)
+    target_sources(ppocr_objects PRIVATE src/indra/metal_head.mm src/indra/metal_rec.mm)
+    set_source_files_properties(src/indra/metal_head.mm src/indra/metal_rec.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc;-fno-fast-math")
+    target_compile_definitions(ppocr_objects PRIVATE PPOCR_INDRA_METAL=1)
+    set(PPOCR_INDRA_METAL_LINK "-framework Metal" "-framework Foundation")
+  endif()
+endif()
+endif()
+
+
+# Apple Silicon matrix units (AMX/SME) are reachable from user code only via
+# Accelerate. Pointwise convolutions and the CTC head use cblas_sgemm there.
+option(PPOCR_USE_ACCELERATE "Use Apple Accelerate for CPU GEMM on Apple platforms" ON)
+if(APPLE AND PPOCR_USE_ACCELERATE)
+  target_compile_definitions(ppocr_objects PRIVATE PPOCR_USE_ACCELERATE=1)
+  list(APPEND PPOCR_METAL_LINK "-framework Accelerate")
+endif()
+if(PPOCR_INDRA_METAL_LINK)
+  list(APPEND PPOCR_METAL_LINK ${PPOCR_INDRA_METAL_LINK})
+endif()
+
+set(PPOCR_INSTALL_TARGETS "")
+
+if(PPOCR_BUILD_STATIC)
+  add_library(ppocr STATIC $<TARGET_OBJECTS:ppocr_objects>)
+  target_include_directories(ppocr PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  target_compile_features(ppocr PUBLIC cxx_std_20)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(ppocr PUBLIC ${CMAKE_DL_LIBS})
+  endif()
+  # Consumers of the static archive need the thread library (glibc < 2.34).
+  find_package(Threads REQUIRED)
+  target_link_libraries(ppocr PUBLIC Threads::Threads)
+  if(PPOCR_METAL_LINK)
+    target_link_libraries(ppocr PUBLIC ${PPOCR_METAL_LINK})
+  endif()
+  set_target_properties(ppocr PROPERTIES OUTPUT_NAME rapidocrlite EXPORT_NAME static)
+  if(WIN32)
+    set_target_properties(ppocr PROPERTIES OUTPUT_NAME rapidocrlite_static)
+  endif()
+  add_library(ppocr::static ALIAS ppocr)
+  add_library(RapidOCRLite::static ALIAS ppocr)
+  list(APPEND PPOCR_INSTALL_TARGETS ppocr)
+endif()
+
+if(PPOCR_BUILD_SHARED)
+  add_library(ppocr_shared SHARED $<TARGET_OBJECTS:ppocr_objects>)
+  target_include_directories(ppocr_shared PUBLIC
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+      $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  target_compile_features(ppocr_shared PUBLIC cxx_std_20)
+  target_compile_definitions(ppocr_shared PUBLIC RPOCR_SHARED)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(ppocr_shared PRIVATE ${CMAKE_DL_LIBS})
+  endif()
+  if(PPOCR_METAL_LINK)
+    target_link_libraries(ppocr_shared PRIVATE ${PPOCR_METAL_LINK})
+  endif()
+  set_target_properties(ppocr_shared PROPERTIES
+      OUTPUT_NAME rapidocrlite
+      EXPORT_NAME rapidocrlite
+      VERSION ${PROJECT_VERSION}
+      SOVERSION ${PROJECT_VERSION_MAJOR})
+  add_library(ppocr::ppocr ALIAS ppocr_shared)
+  add_library(RapidOCRLite::rapidocrlite ALIAS ppocr_shared)
+  list(APPEND PPOCR_INSTALL_TARGETS ppocr_shared)
+endif()
+
+function(ppocr_link_runtime target)
+  if(PPOCR_BUILD_STATIC)
+    target_link_libraries(${target} PRIVATE ppocr)
+  else()
+    target_link_libraries(${target} PRIVATE ppocr_shared)
+  endif()
+endfunction()
+
+# Smoke tools call detail:: symbols. Those symbols are hidden in the shared
+# library, so the tools link the object files instead.
+function(ppocr_link_objects target)
+  target_link_libraries(${target} PRIVATE $<TARGET_OBJECTS:ppocr_objects>)
+  target_include_directories(${target} PRIVATE
+      "${CMAKE_CURRENT_SOURCE_DIR}/include"
+      "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  if(UNIX AND NOT APPLE)
+    target_link_libraries(${target} PRIVATE ${CMAKE_DL_LIBS})
+  endif()
+  if(PPOCR_METAL_LINK)
+    target_link_libraries(${target} PRIVATE ${PPOCR_METAL_LINK})
+  endif()
+endfunction()
+
+if(PPOCR_BUILD_EXAMPLES)
+  add_executable(ppocr_demo examples/ppocr_demo.cpp)
+  ppocr_link_runtime(ppocr_demo)
+
+  add_executable(ppocr_cpp_api_demo examples/cpp_api_demo.cpp)
+  target_link_libraries(ppocr_cpp_api_demo PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  if(PPOCR_BUILD_SHARED)
+    set_target_properties(ppocr_cpp_api_demo PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:ppocr_shared>")
+  endif()
+
+  add_executable(ppocr_c_api_demo examples/c_api_demo.c)
+  target_link_libraries(ppocr_c_api_demo PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  if(PPOCR_BUILD_SHARED)
+    set_target_properties(ppocr_c_api_demo PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:ppocr_shared>")
+  endif()
+
+  # Lite (Indra) model through the public APIs only: C (50-page regression / timing) and C++.
+  add_executable(ppocr_lite_c_test examples/lite_c_test.c)
+  add_executable(ppocr_model_type_test tests/model_type_test.c)
+  target_link_libraries(ppocr_model_type_test PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  target_link_libraries(ppocr_lite_c_test PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  add_executable(ppocr_lite_cpp_check examples/lite_cpp_check.cpp)
+  target_link_libraries(ppocr_lite_cpp_check PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  if(PPOCR_BUILD_SHARED)
+    set_target_properties(ppocr_lite_c_test ppocr_lite_cpp_check ppocr_model_type_test PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:ppocr_shared>")
+  endif()
+
+  add_executable(ppocr_replay examples/ppocr_replay.c)
+  target_link_libraries(ppocr_replay PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  if(PPOCR_BUILD_SHARED)
+    set_target_properties(ppocr_replay PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:ppocr_shared>")
+  endif()
+
+  add_executable(ppocr_isa_bench examples/ppocr_isa_bench.cpp)
+  ppocr_link_objects(ppocr_isa_bench)
+
+  add_executable(ppocr_bench examples/ppocr_bench.cpp)
+  ppocr_link_runtime(ppocr_bench)
+
+  add_executable(ppocr_mem_soak examples/ppocr_mem_soak.cpp)
+  ppocr_link_runtime(ppocr_mem_soak)
+  if(WIN32)
+    target_link_libraries(ppocr_mem_soak PRIVATE psapi)
+  endif()
+
+  add_executable(ppocr_vulkan_smoke examples/ppocr_vulkan_smoke.cpp)
+  ppocr_link_objects(ppocr_vulkan_smoke)
+
+  add_executable(ppocr_metal_check examples/ppocr_metal_check.cpp)
+  ppocr_link_objects(ppocr_metal_check)
+
+  add_executable(ppocr_batch_smoke examples/ppocr_batch_smoke.cpp)
+  ppocr_link_runtime(ppocr_batch_smoke)
+
+  add_executable(ppocr_kernel_smoke examples/ppocr_kernel_smoke.cpp)
+  ppocr_link_objects(ppocr_kernel_smoke)
+
+  add_executable(ppocr_determinism examples/ppocr_determinism.cpp)
+  ppocr_link_objects(ppocr_determinism)
+
+  add_executable(ppocr_gpu_graph_smoke examples/ppocr_gpu_graph_smoke.cpp)
+  ppocr_link_objects(ppocr_gpu_graph_smoke)
+
+  add_executable(ppocr_gpu_frontend_smoke examples/ppocr_gpu_frontend_smoke.cpp)
+  ppocr_link_objects(ppocr_gpu_frontend_smoke)
+
+  add_executable(ppocr_gpu_pipeline_smoke examples/ppocr_gpu_pipeline_smoke.cpp)
+  ppocr_link_objects(ppocr_gpu_pipeline_smoke)
+
+  add_executable(ppocr_gpu_ocr_smoke examples/ppocr_gpu_ocr_smoke.cpp)
+  ppocr_link_runtime(ppocr_gpu_ocr_smoke)
+
+  add_executable(ppocr_vulkan_robust examples/ppocr_vulkan_robust.cpp)
+  ppocr_link_runtime(ppocr_vulkan_robust)
+
+  add_executable(ppocr_gpu_graph_mem_soak examples/ppocr_gpu_graph_mem_soak.cpp)
+  ppocr_link_objects(ppocr_gpu_graph_mem_soak)
+endif()
+
+if(PPOCR_BUILD_TESTS)
+  add_executable(ppocr_c_api_smoke tests/c_api_smoke.c)
+  target_link_libraries(ppocr_c_api_smoke PRIVATE $<IF:$<BOOL:${PPOCR_BUILD_SHARED}>,ppocr_shared,ppocr>)
+  if(PPOCR_BUILD_SHARED)
+    set_target_properties(ppocr_c_api_smoke PROPERTIES BUILD_RPATH "$<TARGET_FILE_DIR:ppocr_shared>")
+  endif()
+  enable_testing()
+  add_test(NAME c_api_smoke COMMAND ppocr_c_api_smoke)
+  if(TARGET ppocr_model_type_test AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite/meta.json")
+    add_test(NAME model_type COMMAND ppocr_model_type_test
+      "${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite"
+      "${CMAKE_CURRENT_SOURCE_DIR}/ci-models/PP-OCRv6_det_tiny.onnx"
+      "${CMAKE_CURRENT_SOURCE_DIR}/ci-models/PP-OCRv6_rec_tiny.onnx"
+      "${CMAKE_CURRENT_SOURCE_DIR}/ci-models/ppocrv6_tiny_dict.txt"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/model_type.ppm")
+  endif()
+  if(TARGET ppocr_lite_c_test AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite/meta.json")
+    if(PPOCR_INDRA_X86 OR PPOCR_CPU MATCHES "x86_64|amd64|x64")
+      set(_lite_arch x86_64)  # 32-bit MSVC builds must reproduce the x86_64 output too
+    elseif(PPOCR_CPU MATCHES "arm64|aarch64")
+      set(_lite_arch arm64)
+    endif()
+    if(_lite_arch AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/data/lite_expected_${_lite_arch}.json")
+      foreach(_t 1 4)
+        add_test(NAME lite_regress_${_t}t COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:ppocr_lite_c_test>
+          "-DMODELS=${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}"
+          -DARCH=${_lite_arch} -DTHREADS=${_t} "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/lite_regress_${_t}.json"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/lite_regress.cmake)
+      endforeach()
+      if(_lite_arch STREQUAL "x86_64")
+        add_test(NAME lite_regress_avx2 COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:ppocr_lite_c_test>
+          "-DMODELS=${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}"
+          -DARCH=${_lite_arch} -DTHREADS=4 -DISA=avx2 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/lite_regress_avx2.json"
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/lite_regress.cmake)
+      endif()
+      add_test(NAME lite_regress_scalar COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:ppocr_lite_c_test>
+        "-DMODELS=${CMAKE_CURRENT_SOURCE_DIR}/python/src/rapidocr/models/lite" "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}"
+        -DARCH=${_lite_arch} -DTHREADS=4 -DSCALAR=1 "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/lite_regress_scalar.json"
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/lite_regress.cmake)
+    endif()
+  endif()
+  if(NOT MSVC AND PPOCR_CPU MATCHES "x86_64|amd64|x64|i[3-6]86")
+    add_test(NAME isa_encoding
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/check_isa_encoding.sh
+            ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ppocr_objects.dir/src/kernels.cpp.o
+            ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ppocr_objects.dir/src/kernels_avx2.cpp.o
+            ${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/ppocr_objects.dir/src/kernels_avx512.cpp.o)
+  endif()
+endif()
+
+if(NOT SKBUILD)
+  install(TARGETS ${PPOCR_INSTALL_TARGETS}
+      EXPORT RapidOCRLiteTargets
+      ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+      INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  install(DIRECTORY include/rapidocrlite DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+  # Library files are librapidocrlite.{so,dylib,a} / rapidocrlite.dll (+ rapidocrlite_static.lib).
+  # Primary package: find_package(RapidOCRLite) -> RapidOCRLite::rapidocrlite (shared), RapidOCRLite::static.
+  install(EXPORT RapidOCRLiteTargets
+      NAMESPACE RapidOCRLite::
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RapidOCRLite)
+  configure_package_config_file(
+      cmake/RapidOCRLiteConfig.cmake.in
+      ${CMAKE_CURRENT_BINARY_DIR}/RapidOCRLiteConfig.cmake
+      INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RapidOCRLite)
+  write_basic_package_version_file(
+      ${CMAKE_CURRENT_BINARY_DIR}/RapidOCRLiteConfigVersion.cmake
+      COMPATIBILITY SameMajorVersion)
+  install(FILES
+      ${CMAKE_CURRENT_BINARY_DIR}/RapidOCRLiteConfig.cmake
+      ${CMAKE_CURRENT_BINARY_DIR}/RapidOCRLiteConfigVersion.cmake
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/RapidOCRLite)
+  # Source compatibility for existing CMake consumers: find_package(ppocr) still works and
+  # provides ppocr::ppocr / ppocr::static as thin wrappers over the RapidOCRLite targets.
+  configure_package_config_file(
+      cmake/ppocrConfig.cmake.in
+      ${CMAKE_CURRENT_BINARY_DIR}/ppocrConfig.cmake
+      INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ppocr)
+  write_basic_package_version_file(
+      ${CMAKE_CURRENT_BINARY_DIR}/ppocrConfigVersion.cmake
+      COMPATIBILITY SameMajorVersion)
+  install(FILES
+      ${CMAKE_CURRENT_BINARY_DIR}/ppocrConfig.cmake
+      ${CMAKE_CURRENT_BINARY_DIR}/ppocrConfigVersion.cmake
+      DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ppocr)
+  install(FILES LICENSE DESTINATION .)
+  install(FILES src/indra/LICENSE-indra-ocr DESTINATION .)
+  install(FILES cmake/SDK-README.md DESTINATION . RENAME README.md)
+else()
+  # scikit-build-core stages the shared library next to the Python package.
+  # One unversioned file: wheels cannot carry symlinks, so a versioned
+  # library would otherwise ship three full copies.
+  set_property(TARGET ppocr_shared PROPERTY VERSION)
+  set_property(TARGET ppocr_shared PROPERTY SOVERSION)
+  if(NOT PPOCR_BUILD_SHARED)
+    message(FATAL_ERROR "The Python wheel needs PPOCR_BUILD_SHARED=ON")
+  endif()
+  install(TARGETS ppocr_shared
+      LIBRARY DESTINATION "${SKBUILD_PLATLIB_DIR}/rapidocr"
+      RUNTIME DESTINATION "${SKBUILD_PLATLIB_DIR}/rapidocr"
+      ARCHIVE DESTINATION "${SKBUILD_PLATLIB_DIR}/rapidocr")
+endif()
