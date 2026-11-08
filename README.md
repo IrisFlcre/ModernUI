@@ -384,9 +384,10 @@ network service through the documented HTTP API.
 
 ## 9. Licensing
 
-No license has yet been declared for the original source code in this repository. Until a
-`LICENSE` file is added, the original code should be treated as all rights reserved. Vendored
-components remain governed by their respective licenses listed in Section 8.
+The original source code in this repository is released under the GNU Lesser General Public
+License, version 3 (LGPL-3.0). The full license text is provided in [LICENSE](LICENSE). Vendored
+components listed in Section 8 remain governed by their respective licenses, which take
+precedence for those files.
 
 ---
 
