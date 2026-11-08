@@ -1,0 +1,73 @@
+name: Build Suite Installer
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: suite-installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows 10+ / CameraPro + Annotation
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 UCRT64
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+
+      - name: Configure Annotation
+        run: >
+          cmake -S Annotation -B Annotation/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build Annotation
+        run: cmake --build Annotation/build -j
+
+      - name: Configure CameraPro
+        run: >
+          cmake -S CameraPro -B CameraPro/build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build CameraPro
+        run: cmake --build CameraPro/build -j
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile suite installer
+        shell: powershell
+        run: |
+          $iscc = @(
+            Get-ChildItem "C:\Program Files (x86)\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue
+            Get-ChildItem "C:\Program Files\Inno Setup*\ISCC.exe" -ErrorAction SilentlyContinue
+          ) | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found" }
+          & $iscc.FullName "installer\CameraProSuite.iss"
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraPro-Annotation-Installer
+          path: dist/CameraPro_Annotation_Setup_*.exe
+          if-no-files-found: error
+          retention-days: 14
