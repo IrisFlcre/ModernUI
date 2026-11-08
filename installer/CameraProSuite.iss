@@ -14,7 +14,7 @@
 ; 输出：D:\ModernUI\dist\CameraPro_Annotation_Setup_0.1.0.exe
 ; ============================================================================
 
-#define AppName "CameraPro 教学展台与批注套件"
+#define AppName "CameraPro Annotation Suite"
 #define AppVersion "0.1.0"
 #define AppPublisher "ModernUI"
 #define AppIdGuid "{{C7A3E1F4-6B2D-4E58-9A10-5D8F3B7C2A61}"
@@ -29,11 +29,11 @@ VersionInfoProductName={#AppName}
 VersionInfoProductVersion={#AppVersion}
 VersionInfoVersion=0.1.0.0
 VersionInfoCompany={#AppPublisher}
-VersionInfoDescription={#AppName} 安装程序
+VersionInfoDescription={#AppName} Setup
 
 ; 两个程序安装到同一目录，共享 icons / models
 DefaultDirName={autopf}\CameraPro Suite
-DefaultGroupName=CameraPro 套件
+DefaultGroupName=CameraPro Suite
 DisableProgramGroupPage=yes
 
 ; 64 位程序（MinGW x86_64）
@@ -55,12 +55,9 @@ RestartApplications=no
 SetupLogging=yes
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [CustomMessages]
-chinesesimplified.DesktopCameraPro=创建 CameraPro 桌面快捷方式
-chinesesimplified.DesktopAnnotation=创建 Annotation 桌面快捷方式
 english.DesktopCameraPro=Create a &desktop shortcut for CameraPro
 english.DesktopAnnotation=Create a &desktop shortcut for Annotation
 
@@ -92,12 +89,12 @@ Source: "..\CameraPro\build\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipi
 Source: "..\Annotation\build\*.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 
 [Icons]
-Name: "{group}\CameraPro 教学展台"; Filename: "{app}\CameraPro.exe"; WorkingDir: "{app}"
-Name: "{group}\Annotation 全屏批注"; Filename: "{app}\Annotation.exe"; WorkingDir: "{app}"
-Name: "{group}\卸载 {#AppName}"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\CameraPro 教学展台"; Filename: "{app}\CameraPro.exe"; WorkingDir: "{app}"; Tasks: desktopcamera
-Name: "{autodesktop}\Annotation 全屏批注"; Filename: "{app}\Annotation.exe"; WorkingDir: "{app}"; Tasks: desktopannotation
+Name: "{group}\CameraPro Document Camera"; Filename: "{app}\CameraPro.exe"; WorkingDir: "{app}"
+Name: "{group}\Annotation Overlay"; Filename: "{app}\Annotation.exe"; WorkingDir: "{app}"
+Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\CameraPro Document Camera"; Filename: "{app}\CameraPro.exe"; WorkingDir: "{app}"; Tasks: desktopcamera
+Name: "{autodesktop}\Annotation Overlay"; Filename: "{app}\Annotation.exe"; WorkingDir: "{app}"; Tasks: desktopannotation
 
 [Run]
-Filename: "{app}\CameraPro.exe"; Description: "{cm:LaunchProgram,CameraPro 教学展台}"; Flags: nowait postinstall skipifsilent
-Filename: "{app}\Annotation.exe"; Description: "{cm:LaunchProgram,Annotation 全屏批注}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\CameraPro.exe"; Description: "{cm:LaunchProgram,CameraPro Document Camera}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Annotation.exe"; Description: "{cm:LaunchProgram,Annotation Overlay}"; Flags: nowait postinstall skipifsilent
