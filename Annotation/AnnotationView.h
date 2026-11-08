@@ -29,6 +29,8 @@ class Win32LayeredWindow;
 
 namespace annotation {
 
+class DocumentPanel;
+
 // 全局热键 ID（main 注册 / handleHotkey 共用）
 enum HotkeyId : int {
     HotkeyToggleVisible = 1,
@@ -113,6 +115,14 @@ private:
     void applyAiReply(const AiReply& reply);
     bool pointOverAiCards(const modern_ui::Vec2i& point) const;
 
+    // ---- 文档解析（OCR 原文 → AI 整理 → Markdown 面板）----
+    void startDocumentParse();
+    void handleDocumentOcrResult(const OcrResult& result);
+    void applyDocumentReply(const AiReply& reply);
+    void showDocumentPanel(const std::string& markdown);
+    void closeDocumentPanel();
+    bool pointOverDocumentPanel(const modern_ui::Vec2i& point) const;
+
     void updateCursor();
     void updateLaser(float dtSeconds);
     void updateToast(float dtSeconds);
@@ -177,6 +187,14 @@ private:
     int aiOcrRequestId_ = 0;
     bool aiBusy_ = false;
     bool aiAwaitingOcr_ = false;
+
+    // 文档解析
+    DocumentPanel* documentPanel_ = nullptr;
+    modern_ui::Rect documentPanelRect_{};
+    bool documentBusy_ = false;
+    bool documentAwaitingOcr_ = false;
+    int documentOcrRequestId_ = 0;
+    int documentRequestId_ = 0;
 
     Tool tool_ = Tool::Pen;
     Tool lastNonPointerTool_ = Tool::Pen;
@@ -247,7 +265,7 @@ private:
     bool hookPolicyInitialized_ = false;
     bool hookPolicySuppressAll_ = false;
     modern_ui::Rect hookPolicyRect_{};
-    std::array<modern_ui::Rect, 4> hookPolicyCardRects_{};
+    std::array<modern_ui::Rect, 8> hookPolicyCardRects_{};
     int32_t hookPolicyCardCount_ = 0;
 };
 

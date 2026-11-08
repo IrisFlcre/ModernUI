@@ -72,10 +72,10 @@ public:
     // 避免批注层内部滚动时把滚轮泄漏给下层应用。空矩形 = 不吞。
     void setWheelSuppressRect(const Rect& suppressRect);
 
-    // 卡片区域（屏幕绝对坐标）：无论是否指针模式，落在这些矩形内的左键
+    // 卡片 / 浮窗区域（屏幕绝对坐标）：无论是否指针模式，落在这些矩形内的左键
     // 与滚轮都吞掉，保证批注层的卡片始终可以交互且滚动不泄漏。
     // 最多 kMaxCardRects 个矩形。
-    static constexpr int32_t kMaxCardRects = 4;
+    static constexpr int32_t kMaxCardRects = 8;
     void setCardSuppressRects(const Rect* rects, int32_t count);
 
     // 主线程非阻塞读取；返回本次读出的事件数
@@ -125,10 +125,10 @@ private:
 
     // 卡片矩形（最多 kMaxCardRects 个；count 的最后一次 store 带 release）
     std::atomic<int32_t> cardRectCount_{0};
-    std::atomic<int32_t> cardRectX_[kMaxCardRects]{0, 0, 0, 0};
-    std::atomic<int32_t> cardRectY_[kMaxCardRects]{0, 0, 0, 0};
-    std::atomic<int32_t> cardRectW_[kMaxCardRects]{0, 0, 0, 0};
-    std::atomic<int32_t> cardRectH_[kMaxCardRects]{0, 0, 0, 0};
+    std::atomic<int32_t> cardRectX_[kMaxCardRects]{};
+    std::atomic<int32_t> cardRectY_[kMaxCardRects]{};
+    std::atomic<int32_t> cardRectW_[kMaxCardRects]{};
+    std::atomic<int32_t> cardRectH_[kMaxCardRects]{};
 };
 
 } // namespace modern_ui

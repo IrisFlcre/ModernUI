@@ -34,7 +34,7 @@ namespace {
 // 基准尺寸（未缩放）；最终 × uiScale（默认 1.5）
 constexpr int32_t kCollapsedWidth = 68;
 constexpr int32_t kExpandedWidth = 304;
-constexpr int32_t kBaseHeight = 660;
+constexpr int32_t kBaseHeight = 706;
 constexpr int32_t kIconColumn = 68;
 constexpr int32_t kButtonSize = 44;
 constexpr int32_t kRowStep = 46;
@@ -44,7 +44,7 @@ const Color kTextSecondary{170, 176, 190, 255};
 const Color kTextTertiary{122, 128, 142, 255};
 const Color kAccent{96, 205, 255, 255};
 
-const char* const kIconFiles[8] = {
+const char* const kIconFiles[9] = {
     "brush.svg",
     "Highlighter.svg",
     "editor-eraser.svg",
@@ -53,6 +53,7 @@ const char* const kIconFiles[8] = {
     "screenshot.svg",
     "scan_type.svg",
     "lights.svg",
+    "scan.svg",
 };
 
 // 0=trash, 1=add, 2=back, 3=forward, 4=quit
@@ -193,7 +194,7 @@ AnnotationToolbar::AnnotationToolbar() {
 }
 
 void AnnotationToolbar::loadIcons(const std::string& directory) {
-    for (int32_t i = 0; i < 8; ++i) {
+    for (int32_t i = 0; i < 9; ++i) {
         const std::string markup = readFile(joinPath(directory, kIconFiles[i]));
         iconWhite_[static_cast<size_t>(i)] =
             tintSvg(markup, Color{238, 242, 250, 255});
@@ -373,6 +374,12 @@ void AnnotationToolbar::setHistoryState(bool canUndo) {
 void AnnotationToolbar::setScreenshotActive(bool active) {
     if (screenshotActive_ == active) return;
     screenshotActive_ = active;
+    visualDirty_ = true;
+}
+
+void AnnotationToolbar::setDocumentActive(bool active) {
+    if (documentActive_ == active) return;
+    documentActive_ = active;
     visualDirty_ = true;
 }
 
@@ -577,6 +584,11 @@ void AnnotationToolbar::activate(Action action) {
         case Action::Ai:
             // AI 模式不切换绘制工具：点击后由视图完成截图 / OCR / 卡片生成。
             if (onAi) onAi();
+            break;
+
+        case Action::Document:
+            // 文档解析：全屏 OCR → AI 还原原文 → Markdown 面板。
+            if (onDocument) onDocument();
             break;
 
         case Action::Undo: if (onUndo) onUndo(); break;
@@ -1139,17 +1151,18 @@ void AnnotationToolbar::rebuildVisuals() {
     int32_t y = SI(12);
     const int32_t buttonX = columnX + (iconColumn - button) / 2;
 
-    static const Action toolActions[8] = {
+    static const Action toolActions[9] = {
         Action::Pen, Action::Highlighter, Action::Eraser,
         Action::Laser, Action::Pointer, Action::Screenshot,
-        Action::Ocr, Action::Ai,
+        Action::Ocr, Action::Ai, Action::Document,
     };
 
-    for (int32_t i = 0; i < 8; ++i) {
+    for (int32_t i = 0; i < 9; ++i) {
         const Rect rect{buttonX, y, button, button};
         const Action action = toolActions[i];
         const bool selected = (action == toolAction(tool_)) ||
-                              (action == Action::Screenshot && screenshotActive_);
+                              (action == Action::Screenshot && screenshotActive_) ||
+                              (action == Action::Document && documentActive_);
         drawToolButton(action, rect, false, selected,
                        iconWhite_[static_cast<size_t>(i)],
                        iconAccent_[static_cast<size_t>(i)],

@@ -6,6 +6,8 @@
 
 #include "AssetPath.h"
 #include "Blend2DRenderer.h"
+#include "DocumentPanel.h"
+#include "DocumentParser.h"
 #include "GlobalMouseHook.h"
 #include "Screenshot.h"
 #include "Win32LayeredWindow.h"
@@ -178,6 +180,7 @@ void AnnotationView::initialize(modern_ui::Blend2DRenderer& renderer,
     toolbar_->onScreenshot = [this] { startScreenshotMode(); };
     toolbar_->onOcr = [this] { startOcrMode(); };
     toolbar_->onAi = [this] { startAiAssist(); };
+    toolbar_->onDocument = [this] { startDocumentParse(); };
     toolbar_->onAddPage = [this] { addPage(); };
     toolbar_->onPrevPage = [this] { gotoPrevPage(); };
     toolbar_->onNextPage = [this] { gotoNextPage(); };
@@ -283,7 +286,7 @@ void AnnotationView::createRootShapes() {
     {
         Shape shape;
         shape.data = GroupData{};
-        shape.base.z = -1500;
+        shape.base.z = -900;
         shape.base.visible = false;
         toastShapeId_ = canvas().addShape(std::move(shape));
     }
@@ -381,7 +384,10 @@ void AnnotationView::onTick(float dtSeconds) {
 
     OcrResult ocrResult;
     while (ocr_.poll(&ocrResult)) {
-        if (aiAwaitingOcr_ && ocrResult.requestId == aiOcrRequestId_) {
+        if (documentAwaitingOcr_ && ocrResult.requestId == documentOcrRequestId_) {
+            documentAwaitingOcr_ = false;
+            handleDocumentOcrResult(ocrResult);
+        } else if (aiAwaitingOcr_ && ocrResult.requestId == aiOcrRequestId_) {
             aiAwaitingOcr_ = false;
             handleAiOcrResult(ocrResult);
         } else if (ocrResult.requestId == ocrRequestId_) {
@@ -390,9 +396,15 @@ void AnnotationView::onTick(float dtSeconds) {
     }
 
     AiReply aiReply;
-    if (ai_.poll(&aiReply) && aiReply.requestId == aiRequestId_) {
-        aiRequestId_ = 0;
-        applyAiReply(aiReply);
+    while (ai_.poll(&aiReply)) {
+        if (aiReply.requestId != 0 && aiReply.requestId == aiRequestId_) {
+            aiRequestId_ = 0;
+            applyAiReply(aiReply);
+        } else if (aiReply.requestId != 0 &&
+                   aiReply.requestId == documentRequestId_) {
+            documentRequestId_ = 0;
+            applyDocumentReply(aiReply);
+        }
     }
 
     if (screenshotDirty_) {
@@ -417,7 +429,8 @@ void AnnotationView::updateCursor() {
 
     const bool show = visible_ && cursorInCanvas_ && !screenshotMode_ &&
                       brushTool && !pointOverToolbar(point) &&
-                      !pointOverAiCards(point);
+                      !pointOverAiCards(point) &&
+                      !pointOverDocumentPanel(point);
 
     const float radius = (tool_ == Tool::Eraser)
         ? std::max(4.0f, eraserSize_ * 0.5f)
@@ -682,6 +695,10 @@ bool AnnotationView::handleAppEvent(const Event& event) {
     cursorDirty_ = true;
 
     const bool overToolbar = pointOverToolbar(integerPoint);
+    const bool overDocument = pointOverDocumentPanel(integerPoint);
+
+    // 文档面板优先：内部交互（拖动 / 缩放 / 滚动 / 按钮）由控件树处理。
+    if (overDocument) return false;
 
     // AI 卡片优先于绘制 / 选区处理；指针模式下卡片区域由 Hook 吞掉左键，
     // 因此卡片始终可交互（拖动移动，短按展开 / 收起 / 关闭）。
@@ -1221,6 +1238,10 @@ void AnnotationView::startOcrMode() {
         showToast("AI 正在识别画面文字，请稍候…", 2.0f);
         return;
     }
+    if (documentBusy_) {
+        showToast("文档解析进行中，请稍候…", 2.0f);
+        return;
+    }
 
     if (screenshotMode_) {
         cancelScreenshotMode();
@@ -1466,7 +1487,7 @@ void AnnotationView::copyAllOcrText() {
 
 void AnnotationView::startAiAssist() {
     if (!initialized_) return;
-    if (aiBusy_) {
+    if (aiBusy_ || documentBusy_) {
         showToast("AI 正在分析，请稍候…", 1.8f);
         return;
     }
@@ -1639,6 +1660,186 @@ void AnnotationView::applyAiReply(const AiReply& reply) {
 
 bool AnnotationView::pointOverAiCards(const Vec2i& point) const {
     return aiCards_.hitTest(point);
+}
+
+// ============================================================================
+// 文档解析（OCR 原文 → AI 整理 → Markdown 面板）
+// ============================================================================
+
+void AnnotationView::startDocumentParse() {
+    if (!initialized_) return;
+    if (aiBusy_ || documentBusy_) {
+        showToast("AI 正在处理，请稍候…", 1.8f);
+        return;
+    }
+    if (!ai_.ready()) {
+        showToast("未找到 API_KEY.txt：请在本程序目录写入 DeepSeek API 密钥", 5.0f);
+        return;
+    }
+    if (!window_ || !ocr_.initialized()) {
+        showToast("OCR 引擎未初始化", 2.4f);
+        return;
+    }
+    if (ocr_.busy()) {
+        showToast("OCR 正在识别，请稍候…", 2.0f);
+        return;
+    }
+
+    if (screenshotMode_) {
+        cancelScreenshotMode();
+        if (toolbar_) toolbar_->setScreenshotActive(false);
+    }
+    if (ocrSelecting_) {
+        ocrSelecting_ = false;
+        selectionRect_ = Rect::null();
+        screenshotDirty_ = true;
+    }
+    cancelActiveInput();
+
+    documentBusy_ = true;
+    documentAwaitingOcr_ = false;
+    documentRequestId_ = 0;
+
+    const Vec2i origin = window_->clientOrigin();
+    const int32_t width = std::max(1, canvas().width());
+    const int32_t height = std::max(1, canvas().height());
+
+    window_->hide();
+    Sleep(35);
+
+    CapturedPixels capture = captureScreenRegionRgb(
+        origin.x, origin.y, width, height);
+
+    canvas().markDirtyAll();
+    drawFrame();
+    window_->show();
+
+    if (!capture.ok || capture.rgb.empty()) {
+        documentBusy_ = false;
+        showToast("全屏截图失败：" + capture.error, 3.0f);
+        return;
+    }
+
+    documentOcrRequestId_ = ocr_.recognize(0, 0, capture.width, capture.height,
+                                          std::move(capture.rgb));
+    if (documentOcrRequestId_ == 0) {
+        documentBusy_ = false;
+        showToast("OCR 任务提交失败", 2.2f);
+        return;
+    }
+
+    documentAwaitingOcr_ = true;
+    showToast("正在截取文档并识别文字…", 10.0f);
+}
+
+void AnnotationView::handleDocumentOcrResult(const OcrResult& result) {
+    if (!result.ok) {
+        documentBusy_ = false;
+        showToast("文字识别失败：" + result.error, 4.0f);
+        return;
+    }
+
+    if (result.lines.empty()) {
+        documentBusy_ = false;
+        showToast("画面中未识别到文字，无法解析文档", 3.2f);
+        return;
+    }
+
+    std::string payload = buildDocumentOcrPayload(
+        canvas().width(), canvas().height(), result.lines);
+    if (payload.empty()) {
+        documentBusy_ = false;
+        showToast("OCR 结果为空", 2.4f);
+        return;
+    }
+
+    documentRequestId_ =
+        ai_.ask(documentParserSystemPrompt(), payload);
+    if (documentRequestId_ == 0) {
+        documentBusy_ = false;
+        showToast("AI 请求提交失败", 2.4f);
+        return;
+    }
+
+    showToast("AI 正在还原文档原文（不增删内容）…", 40.0f);
+}
+
+void AnnotationView::applyDocumentReply(const AiReply& reply) {
+    documentBusy_ = false;
+
+    if (!reply.ok) {
+        showToast("文档解析失败：" + utf8Preview(reply.error, 60), 5.0f);
+        return;
+    }
+
+    const std::string markdown = extractMarkdownFromReply(reply.text);
+    if (markdown.empty()) {
+        showToast("AI 没有返回文档内容", 3.2f);
+        return;
+    }
+
+    showDocumentPanel(markdown);
+    showToast("文档已还原 · 可拖动 / 缩放 / 滚动", 3.2f);
+}
+
+void AnnotationView::showDocumentPanel(const std::string& markdown) {
+    if (!documentPanel_) {
+        documentPanel_ = emplaceChild<DocumentPanel>();
+        documentPanel_->setLayer(-1060);
+
+        Rect bounds = documentPanelRect_;
+        if (bounds.isNull() || bounds.w < 320 || bounds.h < 240) {
+            const int32_t canvasWidth = std::max(1, canvas().width());
+            const int32_t canvasHeight = std::max(1, canvas().height());
+            const int32_t width = std::max(
+                320, std::min(canvasWidth - 24,
+                              static_cast<int32_t>(canvasWidth * 0.48f)));
+            const int32_t height = std::max(
+                240, std::min(canvasHeight - 24,
+                              static_cast<int32_t>(canvasHeight * 0.66f)));
+            bounds = Rect{(canvasWidth - width) / 2,
+                          std::max(16, (canvasHeight - height) / 2 - 20),
+                          width, height};
+        }
+        documentPanel_->setBounds(bounds);
+
+        documentPanel_->onClose = [this] { closeDocumentPanel(); };
+        documentPanel_->onCopy = [this] {
+            if (!documentPanel_) return;
+            if (copyTextToClipboard(documentPanel_->markdown())) {
+                showToast("已复制 Markdown 原文", 2.0f);
+            } else {
+                showToast("复制到剪贴板失败", 2.0f);
+            }
+        };
+        documentPanel_->onBoundsChanged = [this](const Rect& rect) {
+            documentPanelRect_ = rect;
+        };
+    }
+
+    documentPanel_->setDocument("文档解析", markdown);
+    if (toolbar_) toolbar_->setDocumentActive(true);
+    canvas().markDirtyAll();
+    updateHookPolicy();
+}
+
+void AnnotationView::closeDocumentPanel() {
+    if (!documentPanel_) return;
+
+    documentPanelRect_ = documentPanel_->frame();
+    DocumentPanel* panel = documentPanel_;
+    documentPanel_ = nullptr;
+    deferRemoveWidget(panel);
+
+    if (toolbar_) toolbar_->setDocumentActive(false);
+    canvas().markDirtyAll();
+    updateHookPolicy();
+}
+
+bool AnnotationView::pointOverDocumentPanel(const Vec2i& point) const {
+    if (!documentPanel_) return false;
+    const Rect frame = documentPanel_->absoluteFrame();
+    return frame.w > 0 && frame.h > 0 && frame.contains(point);
 }
 
 // ============================================================================
@@ -1857,7 +2058,7 @@ void AnnotationView::updateHookPolicy() {
     if (!hook_) return;
 
     Rect toolbarScreenRect{};
-    std::array<Rect, 4> cardRects{};
+    std::array<Rect, 8> cardRects{};
     int32_t cardCount = 0;
 
     if (visible_ && window_) {
@@ -1866,6 +2067,16 @@ void AnnotationView::updateHookPolicy() {
             const Rect frame = toolbar_->absoluteFrame();
             toolbarScreenRect = Rect{frame.x + origin.x, frame.y + origin.y,
                                      frame.w, frame.h};
+        }
+
+        // 文档面板同样需要吞掉左键与滚轮，保证拖动 / 缩放 / 滚动不泄漏。
+        if (documentPanel_) {
+            const Rect frame = documentPanel_->absoluteFrame();
+            if (frame.w > 0 && frame.h > 0) {
+                cardRects[static_cast<size_t>(cardCount++)] =
+                    Rect{frame.x + origin.x, frame.y + origin.y,
+                         frame.w, frame.h};
+            }
         }
 
         // 滚轮与左键都按每张卡片的精确矩形吞掉，卡片之间空隙不再拦截。

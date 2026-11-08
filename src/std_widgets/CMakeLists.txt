@@ -18,6 +18,7 @@
 #                       MenuBar / CommandBar
 #   FluentMedia       — ImageView / PersonPicture / AnimatedImage(Sprite)
 #   FluentAdvanced    — TreeView / CalendarView / ColorPicker / PipsPager / Sparkline
+#   Markdown          — MarkdownView（可复用 Markdown 文档渲染控件）
 #
 # 统一入口：Fluent.h
 # ============================================================================
@@ -34,6 +35,7 @@ add_library(modernui_std_widgets STATIC
     FluentFeedback.cpp
     FluentMedia.cpp
     FluentAdvanced.cpp
+    Markdown.cpp
     FluentUi.cpp
 )
 

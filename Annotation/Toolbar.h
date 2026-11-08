@@ -55,6 +55,9 @@ public:
     void setPageInfo(int32_t index, int32_t count);
     void setHistoryState(bool canUndo);
     void setScreenshotActive(bool active);
+    // 文档解析面板是否打开（用于按钮高亮）。
+    void setDocumentActive(bool active);
+    bool documentActive() const { return documentActive_; }
     // WPS / PowerPoint 放映联动状态（用于页码着色与提示）。
     void setOfficeState(bool active, bool wps);
     bool expanded() const { return panelMode_ != PanelMode::None; }
@@ -71,6 +74,7 @@ public:
     std::function<void()> onScreenshot;
     std::function<void()> onOcr;
     std::function<void()> onAi;
+    std::function<void()> onDocument;
     std::function<void()> onAddPage;
     std::function<void()> onPrevPage;
     std::function<void()> onNextPage;
@@ -88,7 +92,7 @@ private:
 
     enum class Action : uint8_t {
         None = 0,
-        Pen, Highlighter, Eraser, Laser, Pointer, Screenshot, Ocr, Ai,
+        Pen, Highlighter, Eraser, Laser, Pointer, Screenshot, Ocr, Ai, Document,
         Undo, Clear, Settings, AddPage, PrevPage, NextPage, Close,
     };
 
@@ -119,9 +123,9 @@ private:
     int32_t scaledInt(float value) const;
 
     // 图标（已染色 SVG）
-    std::array<std::string, 8> iconWhite_;
-    std::array<std::string, 8> iconAccent_;
-    std::array<std::string, 8> iconDim_;
+    std::array<std::string, 9> iconWhite_;
+    std::array<std::string, 9> iconAccent_;
+    std::array<std::string, 9> iconDim_;
     // 0=trash, 1=add, 2=back, 3=forward, 4=quit
     std::array<std::string, 5> utilityWhite_;
     std::array<std::string, 5> utilityAccent_;
@@ -149,6 +153,7 @@ private:
     int32_t pageCount_ = 1;
     bool canUndo_ = false;
     bool screenshotActive_ = false;
+    bool documentActive_ = false;
     bool officeActive_ = false;
     bool officeWps_ = false;
 

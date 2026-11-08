@@ -64,6 +64,8 @@ add_executable(modernui_annotation
     OcrEngine.cpp
     AiClient.cpp
     AiCards.cpp
+    DocumentParser.cpp
+    DocumentPanel.cpp
     OfficeBridge.cpp
 )
 
@@ -77,6 +79,7 @@ target_link_libraries(modernui_annotation
         modernui::app
         modernui::backend_blend2d
         modernui::ui
+        modernui::std_widgets
         modernui::canvas
         modernui::event
         modernui::input

@@ -19,6 +19,7 @@
 //                   CommandBar
 //   媒体 / 动画     ImageView / PersonPicture / AnimatedImage (Sprite)
 //   高级            TreeView / CalendarView / ColorPicker / PipsPager / Sparkline
+//   文档            MarkdownView
 //
 // ============================================================================
 
@@ -36,3 +37,4 @@
 #include "FluentTheme.h"
 #include "FluentTypography.h"
 #include "FluentUi.h"
+#include "Markdown.h"
